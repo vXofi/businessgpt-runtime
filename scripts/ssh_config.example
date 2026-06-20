@@ -1,0 +1,6 @@
+Host businessgpt
+    HostName 192.0.2.10
+    User deploy
+    IdentityFile ~/.ssh/<key-file>
+    IdentitiesOnly yes
+
