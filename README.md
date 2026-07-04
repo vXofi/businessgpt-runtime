@@ -43,6 +43,35 @@ scripts/                   Local build and VM deploy helpers
 examples/                  Client snippets for integrations
 ```
 
+## SSH Usage
+
+Connect directly to the VM:
+
+```bash
+ssh -i ~/.ssh/<key-file> deploy@192.0.2.10
+```
+
+Or add the example host from `scripts/ssh_config.example` to your SSH config,
+then use the short alias:
+
+```bash
+ssh businessgpt
+```
+
+Run one command remotely without opening an interactive shell:
+
+```bash
+ssh businessgpt 'docker ps'
+ssh businessgpt 'cd /opt/businessgpt && docker logs --tail=100 businessgpt-api'
+```
+
+Copy files to the VM:
+
+```bash
+scp -i ~/.ssh/<key-file> businessgpt-api.tar.gz deploy@192.0.2.10:/opt/businessgpt/
+scp businessgpt-api.tar.gz businessgpt:/opt/businessgpt/
+```
+
 ## First Setup On VM
 
 Create a shared private network if it does not exist:
@@ -107,4 +136,3 @@ docker exec caddy caddy reload --config /etc/caddy/Caddyfile
 - Close public `8000`.
 - Use `BUSINESSGPT_API_KEY` for `/generate`.
 - Keep secrets in VM env files or shell history-conscious commands, not in git.
-
