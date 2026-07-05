@@ -56,6 +56,15 @@ BUSINESSGPT_N_GPU_LAYERS=0
 BUSINESSGPT_SYSTEM_PROMPT=<optional override>
 ```
 
+Default behavior notes:
+
+- The API does not silently clamp caller-provided `max_tokens` beyond schema
+  validation.
+- The default system prompt tells the model to answer one current thread, not
+  every message in the context.
+- Long pasted messages are normal chat context; the model should react to them,
+  not summarize them unless asked.
+
 ## Build
 
 From repo root:
@@ -79,4 +88,3 @@ docker run -d --name businessgpt-api --restart unless-stopped \
   -v /opt/businessgpt/models:/models:ro \
   businessgpt-api:llama-server
 ```
-

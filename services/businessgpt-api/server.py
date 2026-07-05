@@ -22,10 +22,8 @@ LLAMA_HOST = os.environ.get("LLAMA_HOST", "127.0.0.1")
 LLAMA_PORT = int(os.environ.get("LLAMA_PORT", "8081"))
 LLAMA_URL = f"http://{LLAMA_HOST}:{LLAMA_PORT}"
 
-SYSTEM_PROMPT = os.environ.get(
-    "BUSINESSGPT_SYSTEM_PROMPT",
-    "Configure the system prompt at deployment time.",
-)
+DEFAULT_SYSTEM_PROMPT = "Configure the system prompt at deployment time."
+SYSTEM_PROMPT = os.environ.get("BUSINESSGPT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 
 
 class ChatMessage(BaseModel):
