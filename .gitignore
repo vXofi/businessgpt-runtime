@@ -22,4 +22,5 @@ adapters/
 secrets/
 tokens/
 backups/
-
+.artifacts/
+.cache/
