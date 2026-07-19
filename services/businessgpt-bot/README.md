@@ -269,6 +269,9 @@ or a mention, when an image is sent as a reply to the bot, or when text replies
 directly to an image. Standalone unaddressed images remain silent. The bot
 accepts one image up to 10 MB.
 
+Generated replies have ASCII `@` characters removed before they are sent, so
+model output cannot trigger Telegram username notifications.
+
 First checks:
 
 ```text

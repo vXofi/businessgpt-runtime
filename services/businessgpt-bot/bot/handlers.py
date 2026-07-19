@@ -85,6 +85,10 @@ def _message_content(message: Message | None) -> str:
     return (message.text or message.caption or "").strip()
 
 
+def _disable_telegram_mentions(text: str) -> str:
+    return text.replace("@", "")
+
+
 def _to_dict_list(values: Any) -> Any:
     if values is None:
         return []
@@ -400,7 +404,7 @@ async def _generate_and_reply(
         with suppress(asyncio.CancelledError):
             await typing_task
 
-    response_text = str(result.get("response", "")).strip() or "[empty response]"
+    response_text = _disable_telegram_mentions(str(result.get("response", ""))).strip() or "[empty response]"
     chunks = [response_text[i : i + MAX_TELEGRAM_TEXT] for i in range(0, len(response_text), MAX_TELEGRAM_TEXT)]
     sent_messages = [await message.reply_text(chunk) for chunk in chunks]
     usage = result.get("usage") or {}
