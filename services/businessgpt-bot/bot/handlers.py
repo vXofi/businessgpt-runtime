@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import json
+import logging
 import re
 import shlex
 from contextlib import suppress
@@ -14,7 +14,7 @@ import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update, User
 from telegram.constants import ChatAction, ChatType
 from telegram.error import TelegramError
-from telegram.ext import ContextTypes
+from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 from .businessgpt_client import BusinessGPTClient
 from .config import Config
@@ -23,6 +23,7 @@ from .crypto import FeedbackEncryptor
 from .db import BotDB, validate_name
 from .media_cache import EncryptedMediaCache
 from .tools import TOOL_REGISTRY
+from .validation import validate_allowed_api_url, validate_generation_settings
 
 
 MAX_TELEGRAM_TEXT = 3900
@@ -43,6 +44,8 @@ SETTING_LABELS = {
     "top_k": "Top K",
     "repetition_penalty": "Repeat penalty",
 }
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -104,7 +107,40 @@ async def _reply(message: Message, text: str) -> None:
 
 
 def _is_admin(config: Config, user: Optional[User]) -> bool:
-    return bool(user and user.id in config.admin_user_ids)
+    return bool(user and user.id in config.owner_user_ids)
+
+
+def _is_owner(config: Config, user: Optional[User]) -> bool:
+    return _is_admin(config, user)
+
+
+async def authorize_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stop untrusted updates before they reach cache, command, or reaction handlers."""
+    config, db, *_ = _services(context)
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat and chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        if chat.id in config.allowed_chat_ids:
+            return
+        raise ApplicationHandlerStop
+    if chat and chat.type == ChatType.PRIVATE and user:
+        if _is_owner(config, user):
+            return
+        if update.callback_query is not None:
+            return
+        message = update.effective_message
+        text = _message_content(message)
+        if text.startswith("/start settings_"):
+            try:
+                target = _decode_chat_id(text.split("settings_", 1)[1].split()[0])
+            except (IndexError, ValueError):
+                target = None
+            if target in config.allowed_chat_ids:
+                return
+        session_chat_id = db.get_admin_session_chat(user.id)
+        if session_chat_id in config.allowed_chat_ids:
+            return
+    raise ApplicationHandlerStop
 
 
 def _member_status_is_admin(status: str) -> bool:
@@ -118,8 +154,6 @@ async def _is_authorized_admin(
     target_chat_id: int | None = None,
 ) -> bool:
     config, db, *_ = _services(context)
-    if _is_admin(config, update.effective_user):
-        return True
     message = update.effective_message
     user = update.effective_user
     if not message or not user:
@@ -129,8 +163,16 @@ async def _is_authorized_admin(
             target_chat_id = message.chat_id
         elif message.chat.type == ChatType.PRIVATE:
             target_chat_id = db.get_admin_session_chat(user.id)
-    if target_chat_id is None or target_chat_id >= 0:
+            if (
+                target_chat_id is None
+                and _is_owner(config, user)
+                and len(config.allowed_chat_ids) == 1
+            ):
+                target_chat_id = next(iter(config.allowed_chat_ids))
+    if target_chat_id not in config.allowed_chat_ids:
         return False
+    if _is_owner(config, user):
+        return True
     try:
         member = await context.bot.get_chat_member(target_chat_id, user.id)
     except TelegramError:
@@ -155,9 +197,27 @@ async def _require_admin(
     return False
 
 
-def _target_chat_id(message: Message, user: User | None, db: BotDB) -> int:
+async def _require_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    config, *_ = _services(context)
+    if _is_owner(config, update.effective_user):
+        return True
+    if update.effective_message:
+        await update.effective_message.reply_text("owner access required")
+    return False
+
+
+def _target_chat_id(
+    message: Message,
+    user: User | None,
+    db: BotDB,
+    config: Config | None = None,
+) -> int:
     if message.chat.type == ChatType.PRIVATE and user:
-        return db.get_admin_session_chat(user.id) or message.chat_id
+        session = db.get_admin_session_chat(user.id)
+        if session is not None:
+            return session
+        if config and _is_owner(config, user) and len(config.allowed_chat_ids) == 1:
+            return next(iter(config.allowed_chat_ids))
     return message.chat_id
 
 
@@ -356,18 +416,71 @@ async def _generate_and_reply(
     prompt_override_name: str | None = None,
     settings_chat_id: int | None = None,
 ) -> None:
+    config, db, *_ = _services(context)
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    target_chat_id = settings_chat_id or _target_chat_id(message, user, db, config)
+    if target_chat_id not in config.allowed_chat_ids:
+        await message.reply_text("not allowed")
+        return
+    limiter = context.application.bot_data["generation_limiter"]
+    admission = await limiter.try_start(chat_id=target_chat_id, user_id=user.id)
+    if not admission.allowed:
+        await message.reply_text(f"generation unavailable: {admission.reason}")
+        return
+    try:
+        await _generate_and_reply_inner(
+            update=update,
+            context=context,
+            user_text=user_text,
+            prompt_override_name=prompt_override_name,
+            settings_chat_id=target_chat_id,
+        )
+    finally:
+        await limiter.finish()
+
+
+async def _generate_and_reply_inner(
+    *,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_text: str,
+    prompt_override_name: str | None = None,
+    settings_chat_id: int,
+) -> None:
     config, db, api, encryptor, cache, media_cache = _services(context)
     message = update.effective_message
     if not message:
         return
-    target_chat_id = settings_chat_id or _target_chat_id(message, update.effective_user, db)
+    target_chat_id = settings_chat_id
     active_prompt = db.get_active_prompt(target_chat_id)
     if prompt_override_name:
-        active_prompt = db.get_prompt_by_name(prompt_override_name)
+        active_prompt = db.get_prompt_by_name(target_chat_id, prompt_override_name)
         if active_prompt is None:
             await message.reply_text(f"unknown prompt: {prompt_override_name}")
             return
     model = db.get_active_model_profile(target_chat_id)
+    try:
+        api_url = validate_allowed_api_url(model["api_url"], config.allowed_api_urls)
+    except ValueError as exc:
+        await message.reply_text(f"model profile rejected: {exc}")
+        return
+    if active_prompt is None:
+        try:
+            default_prompt = await api.get_default_prompt(api_url=api_url)
+            prompt_text = str(default_prompt["text"])
+            prompt_name = str(default_prompt["name"])
+            default_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+            if default_hash != str(default_prompt["prompt_hash"]):
+                raise ValueError("default prompt hash mismatch")
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+            await message.reply_text(f"could not load API default prompt: {exc}")
+            return
+    else:
+        prompt_text = str(active_prompt["text"])
+        prompt_name = str(active_prompt["name"])
     generation = db.get_effective_generation_settings(target_chat_id)
     image_source = _image_source(message)
     try:
@@ -387,9 +500,9 @@ async def _generate_and_reply(
     typing_task = asyncio.create_task(_typing(message, stop_typing))
     try:
         result = await api.generate(
-            api_url=model["api_url"],
+            api_url=api_url,
             messages=messages,
-            system_prompt=active_prompt["text"] if active_prompt else None,
+            system_prompt=prompt_text,
             max_tokens=generation["max_tokens"],
             temperature=generation["temperature"],
             top_p=generation["top_p"],
@@ -408,7 +521,10 @@ async def _generate_and_reply(
     chunks = [response_text[i : i + MAX_TELEGRAM_TEXT] for i in range(0, len(response_text), MAX_TELEGRAM_TEXT)]
     sent_messages = [await message.reply_text(chunk) for chunk in chunks]
     usage = result.get("usage") or {}
+    expected_prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+    prompt_hash_verified = usage.get("prompt_hash") == expected_prompt_hash
     feedback_payload = {
+        "feedback_schema_version": 2,
         "trigger": {
             "chat_id": message.chat_id,
             "message_id": message.message_id,
@@ -419,10 +535,17 @@ async def _generate_and_reply(
         },
         "api_request": {
             "messages": _feedback_messages(messages),
-            "system_prompt_name": active_prompt["name"] if active_prompt else None,
-            "system_prompt_text": active_prompt["text"] if active_prompt else None,
+            "system_prompt_name": prompt_name,
+            "system_prompt_text": prompt_text,
+            "system_prompt_hash": expected_prompt_hash,
             "model_profile_name": model["name"],
+            "model_api_url": api_url,
             "generation": generation,
+        },
+        "generation_provenance": {
+            "prompt_hash_verified": prompt_hash_verified,
+            "model": result.get("model"),
+            "usage": usage,
         },
         "api_response": result,
         "bot_response_text": response_text,
@@ -441,6 +564,7 @@ async def _generate_and_reply(
             telegram_message_id=sent.message_id,
             payload=feedback_payload,
             encrypted_payload_b64=encrypted_feedback,
+            schema_version=2,
         )
     first = sent_messages[0]
     cache.add(first.chat_id, CachedMessage(first.message_id, "assistant", response_text))
@@ -484,16 +608,32 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user = update.effective_user
     if not message or not user or not message.text:
         return
-    pending = db.get_pending_action(chat_id=message.chat_id, user_id=user.id)
-    if pending and await _is_authorized_admin(update, context):
-        pending = db.pop_pending_action(chat_id=message.chat_id, user_id=user.id)
+    pending = db.get_pending_action(
+        chat_id=message.chat_id,
+        user_id=user.id,
+        ttl_seconds=config.pending_action_ttl_seconds,
+    )
+    pending_target = pending["target_chat_id"] if pending else None
+    if pending and pending_target is None:
+        db.delete_pending_action(chat_id=message.chat_id, user_id=user.id)
+        pending = None
+    if pending and await _is_authorized_admin(
+        update, context, target_chat_id=int(pending_target)
+    ):
+        target_chat_id = int(pending_target)
         if pending:
             if pending["action"] == "prompt_text":
                 try:
-                    db.upsert_prompt(name=pending["target_name"], text=message.text, created_by=user.id)
+                    db.upsert_prompt(
+                        chat_id=target_chat_id,
+                        name=pending["target_name"],
+                        text=message.text,
+                        created_by=user.id,
+                    )
                 except ValueError as exc:
                     await message.reply_text(str(exc))
                     return
+                db.delete_pending_action(chat_id=message.chat_id, user_id=user.id)
                 await message.reply_text(f"saved prompt: {pending['target_name']}")
                 return
             if pending["action"] == "prompt_new_spec":
@@ -502,21 +642,32 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     await message.reply_text("send a name on the first line and prompt text below it")
                     return
                 try:
-                    prompt = db.upsert_prompt(name=name, text=prompt_text, created_by=user.id)
+                    prompt = db.upsert_prompt(
+                        chat_id=target_chat_id,
+                        name=name,
+                        text=prompt_text,
+                        created_by=user.id,
+                    )
                 except ValueError as exc:
                     await message.reply_text(str(exc))
                     return
+                db.delete_pending_action(chat_id=message.chat_id, user_id=user.id)
                 await message.reply_text(f"saved prompt: {prompt['name']}")
                 return
             if pending["action"] == "prompt_test":
+                db.delete_pending_action(chat_id=message.chat_id, user_id=user.id)
                 await _generate_and_reply(
                     update=update,
                     context=context,
                     user_text=message.text,
                     prompt_override_name=pending["target_name"],
+                    settings_chat_id=target_chat_id,
                 )
                 return
             if pending["action"] in {"model_new_spec", "model_edit_spec"}:
+                if not _is_owner(config, user):
+                    await message.reply_text("owner access required")
+                    return
                 try:
                     args = shlex.split(message.text)
                     if pending["action"] == "model_new_spec":
@@ -527,19 +678,24 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                         if not args:
                             raise ValueError("send: api_url [max] [temp] [top_p] [top_k] [repeat]")
                         name, api_url, values = pending["target_name"], args[0], args[1:]
-                    db.upsert_model_profile(
-                        name=name,
-                        api_url=api_url,
-                        model_label=name,
+                    api_url = validate_allowed_api_url(api_url, config.allowed_api_urls)
+                    values_dict = validate_generation_settings(
                         max_tokens=int(values[0]) if len(values) > 0 else config.default_max_tokens,
                         temperature=float(values[1]) if len(values) > 1 else config.default_temperature,
                         top_p=float(values[2]) if len(values) > 2 else config.default_top_p,
                         top_k=int(values[3]) if len(values) > 3 else config.default_top_k,
                         repetition_penalty=float(values[4]) if len(values) > 4 else config.default_repetition_penalty,
                     )
+                    db.upsert_model_profile(
+                        name=name,
+                        api_url=api_url,
+                        model_label=name,
+                        **values_dict,
+                    )
                 except ValueError as exc:
                     await message.reply_text(str(exc))
                     return
+                db.delete_pending_action(chat_id=message.chat_id, user_id=user.id)
                 await message.reply_text(f"saved model: {name}")
                 return
     if await _text_message_is_trigger(message, context):
@@ -550,6 +706,16 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
 
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _, db, *_ = _services(context)
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    deleted = db.delete_pending_action(chat_id=message.chat_id, user_id=user.id)
+    await message.reply_text("pending action cancelled" if deleted else "no pending action")
+
+
 def _encode_chat_id(chat_id: int) -> str:
     return ("n" if chat_id < 0 else "p") + str(abs(chat_id))
 
@@ -558,6 +724,20 @@ def _decode_chat_id(value: str) -> int:
     if not re.fullmatch(r"[np]\d+", value):
         raise ValueError("invalid settings link")
     return -int(value[1:]) if value[0] == "n" else int(value[1:])
+
+
+def _settings_callback_data(chat_id: int, action: str) -> str:
+    value = f"s:{_encode_chat_id(chat_id)}:{action}"
+    if len(value.encode("utf-8")) > 64:
+        raise ValueError("settings callback exceeds Telegram's 64-byte limit")
+    return value
+
+
+def _parse_settings_callback_data(value: str) -> tuple[int, str]:
+    prefix, encoded_chat_id, action = value.split(":", 2)
+    if prefix != "s" or not action:
+        raise ValueError("invalid settings callback")
+    return _decode_chat_id(encoded_chat_id), action
 
 
 def _settings_button_label(kind: str, name: str, max_length: int = 48) -> str:
@@ -576,7 +756,13 @@ def _prompt_preview_text(name: str, prompt_text: str, max_length: int = 3800) ->
     return f"{header}{prompt_text[:retained].rstrip()}{marker}"
 
 
-def _settings_view(db: BotDB, chat_id: int, *, bot_username: str | None, private: bool) -> tuple[str, InlineKeyboardMarkup]:
+def _settings_view(
+    db: BotDB,
+    chat_id: int,
+    *,
+    bot_username: str | None,
+    private: bool,
+) -> tuple[str, InlineKeyboardMarkup]:
     prompt = db.get_active_prompt(chat_id)
     model = db.get_active_model_profile(chat_id)
     values = db.get_effective_generation_settings(chat_id)
@@ -594,24 +780,24 @@ def _settings_view(db: BotDB, chat_id: int, *, bot_username: str | None, private
             f"Top K: {values['top_k']}",
             f"Repeat penalty: {values['repetition_penalty']}",
             "",
-            "Prompt/model create, edit, delete and test commands work here for this chat."
-            if private else "Open the private editor for prompt/model CRUD.",
+            "Prompt editing works here; model endpoint editing requires an owner."
+            if private else "Open the private editor for prompt management.",
         ]
     )
     rows = [
         [
             InlineKeyboardButton(
                 _settings_button_label("Prompt", prompt_name),
-                callback_data="s:prompt_preview",
+                callback_data=_settings_callback_data(chat_id, "prompt_preview"),
             ),
             InlineKeyboardButton(
                 _settings_button_label("Model", model_name),
-                callback_data="s:models",
+                callback_data=_settings_callback_data(chat_id, "models"),
             ),
         ],
-        [InlineKeyboardButton(f"Context {values['recent_context_messages']}", callback_data="s:field:recent_context_messages"), InlineKeyboardButton(f"Max {values['max_tokens']}", callback_data="s:field:max_tokens")],
-        [InlineKeyboardButton(f"Temp {values['temperature']}", callback_data="s:field:temperature"), InlineKeyboardButton(f"Top P {values['top_p']}", callback_data="s:field:top_p")],
-        [InlineKeyboardButton(f"Top K {values['top_k']}", callback_data="s:field:top_k"), InlineKeyboardButton(f"Repeat {values['repetition_penalty']}", callback_data="s:field:repetition_penalty")],
+        [InlineKeyboardButton(f"Context {values['recent_context_messages']}", callback_data=_settings_callback_data(chat_id, "field:recent_context_messages")), InlineKeyboardButton(f"Max {values['max_tokens']}", callback_data=_settings_callback_data(chat_id, "field:max_tokens"))],
+        [InlineKeyboardButton(f"Temp {values['temperature']}", callback_data=_settings_callback_data(chat_id, "field:temperature")), InlineKeyboardButton(f"Top P {values['top_p']}", callback_data=_settings_callback_data(chat_id, "field:top_p"))],
+        [InlineKeyboardButton(f"Top K {values['top_k']}", callback_data=_settings_callback_data(chat_id, "field:top_k")), InlineKeyboardButton(f"Repeat {values['repetition_penalty']}", callback_data=_settings_callback_data(chat_id, "field:repetition_penalty"))],
     ]
     if not private and bot_username:
         rows.append([InlineKeyboardButton("Edit in private chat", url=f"https://t.me/{bot_username}?start=settings_{_encode_chat_id(chat_id)}")])
@@ -621,9 +807,9 @@ def _settings_view(db: BotDB, chat_id: int, *, bot_username: str | None, private
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_admin(update, context):
         return
-    _, db, *_ = _services(context)
+    config, db, *_ = _services(context)
     message = update.effective_message
-    target = _target_chat_id(message, update.effective_user, db)
+    target = _target_chat_id(message, update.effective_user, db, config)
     _, username = await _bot_identity(context)
     text, keyboard = _settings_view(db, target, bot_username=username, private=message.chat.type == ChatType.PRIVATE)
     await message.reply_text(text, reply_markup=keyboard)
@@ -652,10 +838,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    _, db, api, *_ = _services(context)
+    config, db, api, *_ = _services(context)
     if not query or not query.message:
         return
-    target = _target_chat_id(query.message, update.effective_user, db)
+    try:
+        target, data = _parse_settings_callback_data(query.data or "")
+    except ValueError:
+        await query.answer("stale or invalid settings button", show_alert=True)
+        return
+    if target not in config.allowed_chat_ids:
+        await query.answer("not allowed", show_alert=True)
+        return
     if not await _is_authorized_admin(
         update,
         context,
@@ -663,9 +856,9 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     ):
         await query.answer("not allowed", show_alert=True)
         return
-    data = query.data or ""
     private = query.message.chat.type == ChatType.PRIVATE
-    if data == "s:prompt_preview":
+    cb = lambda action: _settings_callback_data(target, action)
+    if data == "prompt_preview":
         await query.answer()
         active = db.get_active_prompt(target)
         if active is None:
@@ -678,8 +871,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 await query.edit_message_text(
                     "The active model endpoint does not provide prompt preview.",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("Choose prompt", callback_data="s:prompts")],
-                        [InlineKeyboardButton("Back", callback_data="s:home")],
+                        [InlineKeyboardButton("Choose prompt", callback_data=cb("prompts"))],
+                        [InlineKeyboardButton("Back", callback_data=cb("home"))],
                     ]),
                 )
                 return
@@ -687,43 +880,47 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             prompt_name = active["name"]
             prompt_text = active["text"]
         rows = [
-            [InlineKeyboardButton("Choose prompt", callback_data="s:prompts")],
+            [InlineKeyboardButton("Choose prompt", callback_data=cb("prompts"))],
         ]
         if private and active is not None:
             rows.append([
-                InlineKeyboardButton("Edit", callback_data="s:prompt_edit"),
-                InlineKeyboardButton("Test", callback_data="s:prompt_test"),
+                InlineKeyboardButton("Edit", callback_data=cb("prompt_edit")),
+                InlineKeyboardButton("Test", callback_data=cb("prompt_test")),
             ])
-        rows.append([InlineKeyboardButton("Back", callback_data="s:home")])
+        rows.append([InlineKeyboardButton("Back", callback_data=cb("home"))])
         await query.edit_message_text(
             _prompt_preview_text(prompt_name, prompt_text),
             reply_markup=InlineKeyboardMarkup(rows),
         )
         return
-    if data in {"s:prompt_new", "s:model_new"}:
+    if data in {"prompt_new", "model_new"}:
         if not private:
             await query.answer("open the private editor", show_alert=True)
             return
-        action = "prompt_new_spec" if data == "s:prompt_new" else "model_new_spec"
+        if data == "model_new" and not _is_owner(config, update.effective_user):
+            await query.answer("owner access required", show_alert=True)
+            return
+        action = "prompt_new_spec" if data == "prompt_new" else "model_new_spec"
         db.set_pending_action(
             chat_id=query.message.chat_id,
             user_id=update.effective_user.id,
+            target_chat_id=target,
             action=action,
             target_name="new",
         )
         instruction = (
             "Send the next message as:\nname\nprompt text"
-            if data == "s:prompt_new"
+            if data == "prompt_new"
             else "Send the next message as:\nname api_url [max] [temp] [top_p] [top_k] [repeat]"
         )
         await query.edit_message_text(instruction)
         await query.answer()
         return
-    if data in {"s:prompt_edit", "s:prompt_test", "s:model_edit"}:
+    if data in {"prompt_edit", "prompt_test", "model_edit"}:
         if not private:
             await query.answer("open the private editor", show_alert=True)
             return
-        if data.startswith("s:prompt"):
+        if data.startswith("prompt"):
             active = db.get_active_prompt(target)
         else:
             active = db.get_active_model_profile(target)
@@ -731,51 +928,61 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await query.answer("choose a saved item first", show_alert=True)
             return
         action = {
-            "s:prompt_edit": "prompt_text",
-            "s:prompt_test": "prompt_test",
-            "s:model_edit": "model_edit_spec",
+            "prompt_edit": "prompt_text",
+            "prompt_test": "prompt_test",
+            "model_edit": "model_edit_spec",
         }[data]
+        if data == "model_edit" and not _is_owner(config, update.effective_user):
+            await query.answer("owner access required", show_alert=True)
+            return
         db.set_pending_action(
             chat_id=query.message.chat_id,
             user_id=update.effective_user.id,
+            target_chat_id=target,
             action=action,
             target_name=active["name"],
         )
         instruction = {
-            "s:prompt_edit": f"Send the replacement text for prompt {active['name']}.",
-            "s:prompt_test": f"Send a test message for prompt {active['name']}.",
-            "s:model_edit": "Send: api_url [max] [temp] [top_p] [top_k] [repeat]",
+            "prompt_edit": f"Send the replacement text for prompt {active['name']}.",
+            "prompt_test": f"Send a test message for prompt {active['name']}.",
+            "model_edit": "Send: api_url [max] [temp] [top_p] [top_k] [repeat]",
         }[data]
         await query.edit_message_text(instruction)
         await query.answer()
         return
-    if data in {"s:prompt_delete", "s:model_delete"}:
-        active = db.get_active_prompt(target) if data == "s:prompt_delete" else db.get_active_model_profile(target)
+    if data in {"prompt_delete", "model_delete"}:
+        if data == "model_delete" and not _is_owner(config, update.effective_user):
+            await query.answer("owner access required", show_alert=True)
+            return
+        active = db.get_active_prompt(target) if data == "prompt_delete" else db.get_active_model_profile(target)
         if active is None or active["name"] == "default":
             await query.answer("nothing deletable is active", show_alert=True)
             return
-        kind = "prompt" if data == "s:prompt_delete" else "model"
+        kind = "prompt" if data == "prompt_delete" else "model"
         await query.edit_message_text(
             f"Delete {kind} {active['name']}?",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Delete", callback_data=f"s:{kind}_delete_confirm:{active['id']}")],
-                [InlineKeyboardButton("Cancel", callback_data=f"s:{kind}s")],
+                [InlineKeyboardButton("Delete", callback_data=cb(f"{kind}_delete_confirm:{active['id']}"))],
+                [InlineKeyboardButton("Cancel", callback_data=cb(f"{kind}s"))],
             ]),
         )
         await query.answer()
         return
-    if data.startswith("s:prompt_delete_confirm:"):
-        active = db.get_prompt_by_id(int(data.rsplit(":", 1)[1]))
+    if data.startswith("prompt_delete_confirm:"):
+        active = db.get_prompt_by_id(target, int(data.rsplit(":", 1)[1]))
         if active:
-            db.soft_delete_prompt(active["name"])
+            db.soft_delete_prompt(target, active["name"])
             db.set_active_prompt(target, None)
-    if data.startswith("s:model_delete_confirm:"):
+    if data.startswith("model_delete_confirm:"):
+        if not _is_owner(config, update.effective_user):
+            await query.answer("owner access required", show_alert=True)
+            return
         active = db.get_model_by_id(int(data.rsplit(":", 1)[1]))
         if active and active["name"] != "default":
             db.soft_delete_model_profile(active["name"])
             db.set_active_model_profile(target, None)
-    if data.startswith("s:set:"):
-        _, _, field, raw = data.split(":", 3)
+    if data.startswith("set:"):
+        _, field, raw = data.split(":", 2)
         options = SETTING_OPTIONS.get(field)
         if options is None:
             await query.answer("unknown setting", show_alert=True)
@@ -785,57 +992,72 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await query.answer("invalid value", show_alert=True)
             return
         db.set_chat_setting(target, field, value)
-    elif data.startswith("s:prompt:"):
+    elif data.startswith("prompt:"):
         prompt_id = int(data.rsplit(":", 1)[1])
+        if prompt_id != 0 and db.get_prompt_by_id(target, prompt_id) is None:
+            await query.answer("unknown prompt", show_alert=True)
+            return
         db.set_active_prompt(target, None if prompt_id == 0 else prompt_id)
-    elif data.startswith("s:model:"):
-        db.set_active_model_profile(target, int(data.rsplit(":", 1)[1]))
+    elif data.startswith("model:"):
+        model = db.get_model_by_id(int(data.rsplit(":", 1)[1]))
+        if model is None:
+            await query.answer("unknown model", show_alert=True)
+            return
+        try:
+            validate_allowed_api_url(model["api_url"], config.allowed_api_urls)
+        except ValueError as exc:
+            await query.answer(str(exc), show_alert=True)
+            return
+        db.set_active_model_profile(target, model["id"])
 
-    if data.startswith("s:field:"):
-        field = data.removeprefix("s:field:")
+    if data.startswith("field:"):
+        field = data.removeprefix("field:")
+        if field not in SETTING_OPTIONS:
+            await query.answer("unknown setting", show_alert=True)
+            return
         values = db.get_effective_generation_settings(target)
         buttons = [
             InlineKeyboardButton(
                 ("* " if option == values[field] else "") + str(option),
-                callback_data=f"s:set:{field}:{option}",
+                callback_data=cb(f"set:{field}:{option}"),
             )
             for option in SETTING_OPTIONS[field]
         ]
         rows = [buttons[index : index + 3] for index in range(0, len(buttons), 3)]
-        rows.append([InlineKeyboardButton("Back", callback_data="s:home")])
+        rows.append([InlineKeyboardButton("Back", callback_data=cb("home"))])
         await query.edit_message_text(SETTING_LABELS[field], reply_markup=InlineKeyboardMarkup(rows))
         await query.answer()
         return
-    if data == "s:prompts":
+    if data == "prompts":
         prompt = db.get_active_prompt(target)
-        rows = [[InlineKeyboardButton(("* " if prompt is None else "") + "API default", callback_data="s:prompt:0")]]
+        rows = [[InlineKeyboardButton(("* " if prompt is None else "") + "API default", callback_data=cb("prompt:0"))]]
         rows.extend(
             [InlineKeyboardButton(
                 ("* " if prompt and row["id"] == prompt["id"] else "") + row["name"],
-                callback_data=f"s:prompt:{row['id']}",
+                callback_data=cb(f"prompt:{row['id']}"),
             )]
-            for row in db.list_prompts()
+            for row in db.list_prompts(target)
         )
-        rows.append([InlineKeyboardButton("Back", callback_data="s:home")])
+        rows.append([InlineKeyboardButton("Back", callback_data=cb("home"))])
         if private:
             rows.insert(-1, [
-                InlineKeyboardButton("New", callback_data="s:prompt_new"),
-                InlineKeyboardButton("Edit", callback_data="s:prompt_edit"),
-                InlineKeyboardButton("Test", callback_data="s:prompt_test"),
+                InlineKeyboardButton("New", callback_data=cb("prompt_new")),
+                InlineKeyboardButton("Edit", callback_data=cb("prompt_edit")),
+                InlineKeyboardButton("Test", callback_data=cb("prompt_test")),
             ])
-            rows.insert(-1, [InlineKeyboardButton("Delete active", callback_data="s:prompt_delete")])
+            rows.insert(-1, [InlineKeyboardButton("Delete active", callback_data=cb("prompt_delete"))])
         await query.edit_message_text("Choose prompt", reply_markup=InlineKeyboardMarkup(rows))
         await query.answer()
         return
-    if data == "s:models":
+    if data == "models":
         active = db.get_active_model_profile(target)
-        rows = [[InlineKeyboardButton(("* " if row["id"] == active["id"] else "") + row["name"], callback_data=f"s:model:{row['id']}")] for row in db.list_model_profiles()]
-        rows.append([InlineKeyboardButton("Back", callback_data="s:home")])
-        if private:
+        rows = [[InlineKeyboardButton(("* " if row["id"] == active["id"] else "") + row["name"], callback_data=cb(f"model:{row['id']}"))] for row in db.list_model_profiles() if row["api_url"] in config.allowed_api_urls]
+        rows.append([InlineKeyboardButton("Back", callback_data=cb("home"))])
+        if private and _is_owner(config, update.effective_user):
             rows.insert(-1, [
-                InlineKeyboardButton("New", callback_data="s:model_new"),
-                InlineKeyboardButton("Edit", callback_data="s:model_edit"),
-                InlineKeyboardButton("Delete active", callback_data="s:model_delete"),
+                InlineKeyboardButton("New", callback_data=cb("model_new")),
+                InlineKeyboardButton("Edit", callback_data=cb("model_edit")),
+                InlineKeyboardButton("Delete active", callback_data=cb("model_delete")),
             ])
         await query.edit_message_text("Choose model endpoint", reply_markup=InlineKeyboardMarkup(rows))
         await query.answer()
@@ -843,59 +1065,63 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     _, username = await _bot_identity(context)
     text, keyboard = _settings_view(db, target, bot_username=username, private=query.message.chat.type == ChatType.PRIVATE)
     await query.edit_message_text(text, reply_markup=keyboard)
-    await query.answer("saved" if data.startswith(("s:set:", "s:prompt:", "s:model:")) else None)
+    await query.answer("saved" if data.startswith(("set:", "prompt:", "model:")) else None)
 
 
 async def prompts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_admin(update, context): return
-    _, db, *_ = _services(context)
-    prompts = db.list_prompts()
+    config, db, *_ = _services(context)
+    target = _target_chat_id(update.effective_message, update.effective_user, db, config)
+    prompts = db.list_prompts(target)
     await _reply(update.effective_message, "\n".join(["prompts:", *[f"- {row['name']}" for row in prompts]]) if prompts else "no prompts")
 
 
 async def prompt_show_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_admin(update, context): return
-    _, db, *_ = _services(context)
+    config, db, *_ = _services(context)
     message = update.effective_message
-    target = _target_chat_id(message, update.effective_user, db)
-    prompt = db.get_prompt_by_name(context.args[0]) if context.args else db.get_active_prompt(target)
+    target = _target_chat_id(message, update.effective_user, db, config)
+    prompt = db.get_prompt_by_name(target, context.args[0]) if context.args else db.get_active_prompt(target)
     await _reply(message, f"{prompt['name']}:\n\n{prompt['text']}" if prompt else "no prompt")
 
 
 async def prompt_use_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_admin(update, context): return
-    _, db, *_ = _services(context); message = update.effective_message
+    config, db, *_ = _services(context); message = update.effective_message
     if not context.args: await message.reply_text("usage: /prompt_use <name>"); return
-    prompt = db.get_prompt_by_name(context.args[0])
+    target = _target_chat_id(message, update.effective_user, db, config)
+    prompt = db.get_prompt_by_name(target, context.args[0])
     if not prompt: await message.reply_text("unknown prompt"); return
-    db.set_active_prompt(_target_chat_id(message, update.effective_user, db), prompt["id"])
+    db.set_active_prompt(target, prompt["id"])
     await message.reply_text(f"active prompt: {prompt['name']}")
 
 
 async def prompt_new_or_edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_admin(update, context): return
-    _, db, *_ = _services(context); message = update.effective_message; user = update.effective_user
+    config, db, *_ = _services(context); message = update.effective_message; user = update.effective_user
     if not context.args: await message.reply_text("usage: /prompt_new <name> [text] or /prompt_edit <name> [text]"); return
     try: name = validate_name(context.args[0])
     except ValueError as exc: await message.reply_text(str(exc)); return
     inline_text = " ".join(context.args[1:]).strip()
+    target = _target_chat_id(message, user, db, config)
     if inline_text:
-        db.upsert_prompt(name=name, text=inline_text, created_by=user.id); await message.reply_text(f"saved prompt: {name}"); return
-    db.set_pending_action(chat_id=message.chat_id, user_id=user.id, action="prompt_text", target_name=name)
+        db.upsert_prompt(chat_id=target, name=name, text=inline_text, created_by=user.id); await message.reply_text(f"saved prompt: {name}"); return
+    db.set_pending_action(chat_id=message.chat_id, user_id=user.id, target_chat_id=target, action="prompt_text", target_name=name)
     await message.reply_text(f"send next message as prompt text for: {name}")
 
 
 async def prompt_delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_admin(update, context): return
-    _, db, *_ = _services(context); message = update.effective_message
+    config, db, *_ = _services(context); message = update.effective_message
     if not context.args: await message.reply_text("usage: /prompt_delete <name>"); return
-    await message.reply_text("deleted" if db.soft_delete_prompt(context.args[0]) else "unknown prompt")
+    target = _target_chat_id(message, update.effective_user, db, config)
+    await message.reply_text("deleted" if db.soft_delete_prompt(target, context.args[0]) else "unknown prompt")
 
 
 async def prompt_reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_admin(update, context): return
-    _, db, *_ = _services(context); message = update.effective_message
-    db.set_active_prompt(_target_chat_id(message, update.effective_user, db), None)
+    config, db, *_ = _services(context); message = update.effective_message
+    db.set_active_prompt(_target_chat_id(message, update.effective_user, db, config), None)
     await message.reply_text("active prompt reset to API default")
 
 
@@ -907,48 +1133,53 @@ async def prompt_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_admin(update, context): return
-    _, db, *_ = _services(context)
-    lines = ["models:", *[f"- {row['name']} {row['api_url']}" for row in db.list_model_profiles()]]
+    config, db, *_ = _services(context)
+    lines = ["models:", *[f"- {row['name']} {row['api_url']}" for row in db.list_model_profiles() if row["api_url"] in config.allowed_api_urls]]
     await _reply(update.effective_message, "\n".join(lines))
 
 
 async def model_show_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_admin(update, context): return
-    _, db, *_ = _services(context); message = update.effective_message
-    target = _target_chat_id(message, update.effective_user, db)
+    config, db, *_ = _services(context); message = update.effective_message
+    target = _target_chat_id(message, update.effective_user, db, config)
     model = db.get_model_by_name(context.args[0]) if context.args else db.get_active_model_profile(target)
     await _reply(message, "\n".join(f"{field}: {model[field]}" for field in ("name", "api_url", "model_label", "max_tokens", "temperature", "top_p", "top_k", "repetition_penalty")))
 
 
 async def model_use_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_admin(update, context): return
-    _, db, *_ = _services(context); message = update.effective_message
+    config, db, *_ = _services(context); message = update.effective_message
     if not context.args: await message.reply_text("usage: /model_use <name>"); return
     model = db.get_model_by_name(context.args[0])
     if not model: await message.reply_text("unknown model"); return
-    db.set_active_model_profile(_target_chat_id(message, update.effective_user, db), model["id"])
+    try: validate_allowed_api_url(model["api_url"], config.allowed_api_urls)
+    except ValueError as exc: await message.reply_text(str(exc)); return
+    db.set_active_model_profile(_target_chat_id(message, update.effective_user, db, config), model["id"])
     await message.reply_text(f"active model: {model['name']}")
 
 
 async def model_new_or_edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _require_admin(update, context): return
+    if not await _require_owner(update, context): return
     config, db, *_ = _services(context); message = update.effective_message; args = context.args or []
     if len(args) < 2:
         await message.reply_text("usage: /model_new <name> <api_url> [max_tokens] [temperature] [top_p] [top_k] [repetition_penalty]"); return
     try:
-        name = validate_name(args[0]); api_url = args[1]
+        name = validate_name(args[0]); api_url = validate_allowed_api_url(args[1], config.allowed_api_urls)
         max_tokens = int(args[2]) if len(args) > 2 else config.default_max_tokens
         temperature = float(args[3]) if len(args) > 3 else config.default_temperature
         top_p = float(args[4]) if len(args) > 4 else config.default_top_p
         top_k = int(args[5]) if len(args) > 5 else config.default_top_k
         repeat = float(args[6]) if len(args) > 6 else config.default_repetition_penalty
     except ValueError as exc: await message.reply_text(str(exc)); return
-    db.upsert_model_profile(name=name, api_url=api_url, model_label=name, max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k, repetition_penalty=repeat)
+    try:
+        values = validate_generation_settings(max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k, repetition_penalty=repeat)
+        db.upsert_model_profile(name=name, api_url=api_url, model_label=name, **values)
+    except ValueError as exc: await message.reply_text(str(exc)); return
     await message.reply_text(f"saved model: {name}")
 
 
 async def model_delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _require_admin(update, context): return
+    if not await _require_owner(update, context): return
     _, db, *_ = _services(context); message = update.effective_message
     if not context.args: await message.reply_text("usage: /model_delete <name>"); return
     if context.args[0] == "default": await message.reply_text("default model cannot be deleted"); return
@@ -958,10 +1189,11 @@ async def model_delete_command(update: Update, context: ContextTypes.DEFAULT_TYP
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_admin(update, context): return
     config, db, *_ = _services(context); message = update.effective_message
-    target = _target_chat_id(message, update.effective_user, db)
+    target = _target_chat_id(message, update.effective_user, db, config)
     prompt = db.get_active_prompt(target); model = db.get_active_model_profile(target); values = db.get_effective_generation_settings(target)
     bot_id, username = await _bot_identity(context)
-    await _reply(message, "\n".join([f"bot: @{username} ({bot_id})" if username else f"bot: {bot_id}", f"db: {config.db_path}", f"settings_chat: {target}", f"active_prompt: {prompt['name'] if prompt else 'api-default'}", f"active_model: {model['name']}", f"context_messages: {values['recent_context_messages']}"]))
+    stats = db.feedback_stats()
+    await _reply(message, "\n".join([f"bot: @{username} ({bot_id})" if username else f"bot: {bot_id}", f"db: {config.db_path}", f"settings_chat: {target}", f"active_prompt: {prompt['name'] if prompt else 'api-default'}", f"active_model: {model['name']}", f"context_messages: {values['recent_context_messages']}", f"feedback_pending: {stats['unreacted_rows']}", f"feedback_reacted: {stats['reacted_rows']}", f"feedback_media: {stats['media_rows']}"]))
 
 
 async def tools_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -990,4 +1222,14 @@ async def reaction_update(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    print("bot handler error", json.dumps({"update": str(update), "error": repr(context.error)}, ensure_ascii=False), flush=True)
+    update_id = getattr(update, "update_id", None)
+    effective_chat = getattr(update, "effective_chat", None)
+    effective_user = getattr(update, "effective_user", None)
+    logger.error(
+        "bot handler error update_id=%s update_type=%s chat_id=%s user_id=%s",
+        update_id,
+        type(update).__name__,
+        getattr(effective_chat, "id", None),
+        getattr(effective_user, "id", None),
+        exc_info=context.error,
+    )

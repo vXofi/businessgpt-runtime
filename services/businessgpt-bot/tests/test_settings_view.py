@@ -19,7 +19,7 @@ class SettingsViewTests(unittest.TestCase):
                 top_k=50,
                 repetition_penalty=1.2,
             )
-            prompt = db.upsert_prompt(name="drunk_short", text="test", created_by=1)
+            prompt = db.upsert_prompt(chat_id=-100, name="drunk_short", text="test", created_by=1)
             db.set_active_prompt(-100, prompt["id"])
 
             _, keyboard = _settings_view(
@@ -32,7 +32,7 @@ class SettingsViewTests(unittest.TestCase):
             self.assertEqual(keyboard.inline_keyboard[0][0].text, "Prompt: drunk_short")
             self.assertEqual(
                 keyboard.inline_keyboard[0][0].callback_data,
-                "s:prompt_preview",
+                "s:n100:prompt_preview",
             )
             self.assertEqual(keyboard.inline_keyboard[0][1].text, "Model: default")
             db.close()

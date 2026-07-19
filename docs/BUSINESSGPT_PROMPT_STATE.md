@@ -1,206 +1,179 @@
-# BusinessGPT Prompt State
+# BusinessGPT Prompt And Feedback State
 
-Keep `businessgpt-api` mostly stateless. It should run generation, enforce API
-auth, accept an optional trusted `system_prompt` override, and return
-`usage.prompt_hash`.
-
-Prompt presets, active prompt selection, model profile selection, admin UX, and
-reaction feedback should live in the Telegram bot or another caller.
-
-## Target Flow
+`businessgpt-api` stays generation-focused. Telegram-specific state belongs to
+`businessgpt-bot` and persists in SQLite.
 
 ```text
-Telegram chat
-  |
-  v
-businessgpt-bot
-  - admin commands
-  - prompt presets
-  - model profiles
-  - active prompt per chat
-  - active model per chat
-  - encrypted reaction samples
-  - SQLite storage
-  |
-  v
-businessgpt-api
-  - generation only
-  - accepts trusted system_prompt override
-  - ignores role=system inside messages
-  |
-  v
-llama-server
+Telegram group
+  -> businessgpt-bot
+       group-scoped prompts and settings
+       global owner-managed endpoint profiles
+       bounded RAM context
+       encrypted feedback/provenance
+  -> businessgpt-api
+       authenticated generation
+       context-window fitting
+       model provenance
+  -> llama-server
 ```
 
 ## API Contract
 
-`POST /generate` accepts:
+`POST /generate` accepts an optional authenticated `system_prompt` override.
+Without it, the API uses its compiled/env default. `role=system` inside
+`messages` is ignored. Generation returns `usage.prompt_hash` and provenance,
+not prompt text. Authenticated `GET /prompt` exists for trusted bot preview and
+exact prompt capture.
 
-```json
-{
-  "messages": [
-    {"role": "user", "name": "example-user", "content": "text"}
-  ],
-  "system_prompt": "Ты BusinessGPT...",
-  "max_tokens": 256,
-  "temperature": 0.9
-}
+## Authorization Boundaries
+
+- Only chats in `BUSINESSGPT_BOT_ALLOWED_CHAT_IDS` reach handlers.
+- Telegram group owners/admins manage prompt presets and generation settings
+  for that allowed group.
+- `BUSINESSGPT_BOT_OWNER_USER_IDS` can recover any allowed group and is the only
+  role that mutates global model endpoint profiles.
+- Model endpoints must exactly match `BUSINESSGPT_BOT_ALLOWED_API_URLS` before
+  the API key is sent.
+- Private editor sessions and every inline callback are bound to an explicit
+  target group and re-check live group administration.
+
+## SQLite Ownership
+
+Current implementation: `services/businessgpt-bot/bot/db.py`.
+
+Important tables:
+
+| Table | Ownership and purpose |
+| --- | --- |
+| `prompt_presets_v2` | Prompt text keyed by `(chat_id, name)`, soft delete |
+| `model_profiles` | Global allowlisted endpoint and bounded defaults, soft delete |
+| `chat_settings` | Active prompt/model plus per-group generation overrides |
+| `pending_admin_actions` | Target-bound two-message editor state with TTL |
+| `admin_sessions` | Private editor target with live membership rechecks |
+| `outbound_messages` | Telegram answer IDs eligible for reactions |
+| `encrypted_feedback_samples` | Sealed schema-v1/v2 generation records |
+| `reaction_events` | Every old/new reaction transition |
+| `pending_feedback_media` | Paths to short-lived sealed image files |
+| `encrypted_feedback_media` | Reaction-selected sealed image bytes |
+| `schema_metadata` | One-time migration markers |
+
+The legacy global `prompt_presets` columns remain during compatibility
+migration. Startup copies active legacy prompts into `prompt_presets_v2` for
+their group without deleting v1 rows, so old exports and foreign keys remain
+readable.
+
+Prompt and model soft deletion supports recovery from administrative mistakes.
+The active prompt is always resolved inside its group; IDs from another group
+are rejected.
+
+## Context Model
+
+Ordinary chat bodies are not persisted as a general message archive. The bot
+keeps a bounded in-process cache:
+
+```text
+20 messages/chat
+64 chats
+6-hour idle TTL
+10 messages included by default
 ```
 
-Rules:
+The cache clears on restart. When generation occurs, the exact selected context
+is copied into that answer's encrypted feedback payload. Consequently, a
+reaction-selected sample remains self-contained for future training without
+turning SQLite into an unlimited plaintext group-message log.
 
-- If `system_prompt` is provided by the authenticated caller, use it.
-- Otherwise use the API default prompt.
-- Ignore `role=system` inside `messages`.
-- Return `usage.prompt_hash`, not the prompt text.
-- Expose the live default text only through authenticated `GET /prompt` for
-  trusted administration clients; normal generation responses still return
-  only the hash.
+## Feedback Schema V2
 
-## Implemented Bot Storage
+Each encrypted payload contains:
 
-SQLite is enough. Current implementation lives in
-`services/businessgpt-bot/bot/db.py`.
-
-```sql
-create table prompt_presets (
-    id integer primary key,
-    name text not null unique,
-    text text not null,
-    created_by integer,
-    created_at text not null,
-    updated_at text not null,
-    deleted_at text
-);
-
-create table chat_settings (
-    chat_id integer primary key,
-    active_prompt_id integer references prompt_presets(id),
-    active_model_profile_id integer references model_profiles(id)
-);
-
-create table model_profiles (
-    id integer primary key,
-    name text not null unique,
-    api_url text not null,
-    model_label text not null,
-    max_tokens integer not null,
-    temperature real not null,
-    top_p real not null,
-    top_k integer not null,
-    repetition_penalty real not null,
-    created_at text not null,
-    updated_at text not null,
-    deleted_at text
-);
-
-create table outbound_messages (
-    id integer primary key,
-    chat_id integer not null,
-    telegram_message_id integer not null,
-    prompt_preset_id integer references prompt_presets(id),
-    model_profile_id integer references model_profiles(id),
-    prompt_hash text,
-    created_at text not null,
-    unique(chat_id, telegram_message_id)
-);
-
-create table reaction_events (
-    id integer primary key,
-    chat_id integer not null,
-    telegram_message_id integer not null,
-    user_id integer,
-    old_reaction_json text not null,
-    new_reaction_json text not null,
-    created_at text not null
-);
-
-create table encrypted_feedback_samples (
-    id integer primary key,
-    chat_id integer not null,
-    telegram_message_id integer not null,
-    reaction_event_id integer references reaction_events(id),
-    payload_json_sha256 text not null,
-    encrypted_payload_b64 text not null,
-    created_at text not null
-);
+```text
+feedback_schema_version
+trigger message/user metadata
+complete API request messages
+system prompt name/text/hash
+model profile name and API URL
+effective generation settings
+model and projector SHA-256
+llama.cpp revision
+context-fit version and retained source indexes
+token/truncation metadata
+complete API response
+final Telegram response text
 ```
 
-`chat_settings` also contains per-chat generation overrides and
-`recent_context_messages`. Recent message bodies are deliberately absent from
-SQLite: the bot keeps a bounded 20-message process-local RAM buffer.
+Image bytes are not embedded in this JSON. The request record contains image
+hash provenance, while sealed image bytes live in the pending/promoted media
+tables.
 
-Image feedback uses `pending_feedback_media` for paths to short-lived sealed
-ciphertext and `encrypted_feedback_media` for reaction-selected ciphertext.
-Plain image bytes are never written on the VM.
+The first non-empty reaction marks the encrypted sample as selected for
+long-term retention. Every later add/change/remove event is still appended to
+`reaction_events`; the exporter returns both `reaction_history` and
+`final_reaction_state`.
 
-Use soft-delete for prompt presets and model profiles so mistakes can be
-recovered.
+This is labeled feedback, not automatically pairwise RLHF. Building a reward
+model or DPO dataset still requires an explicit transformation policy. Exact
+request and runtime provenance is retained so that transformation can be
+reproducible later.
 
-Generation samples are encrypted before they are stored. The VM needs only the
-PC public key. Keep the private key off the VM.
+## Retention
 
-## Telegram Commands
+```text
+unreacted samples: 7-day TTL, 5,000 rows, 512 MiB
+reacted samples:   50,000 rows, 4 GiB
+pending media:     24-hour TTL, 256 MiB
+reacted media:     2 GiB
+```
 
-Admin-only:
+Hourly maintenance removes expired/orphaned rows and files, enforces newest-
+first caps, removes metadata no longer referenced by samples/media, checkpoints
+the WAL, performs incremental vacuuming, and warns on low disk space.
+
+## Telegram UX
+
+Primary interface:
+
+```text
+/settings
+```
+
+The settings view displays active prompt/model names and bounded generation
+values. Pressing the prompt button previews actual text. Group views provide an
+encoded private-editor link for multi-message prompt operations.
+
+Prompt commands:
 
 ```text
 /prompts
-/prompt_show
+/prompt_show [name]
 /prompt_use <name>
-/prompt_new <name>
-/prompt_edit <name>
+/prompt_new <name> [text]
+/prompt_edit <name> [text]
 /prompt_delete <name>
 /prompt_reset
 /prompt_test <name> <message>
 ```
 
-Authorization is scoped to Telegram: a group owner or administrator can manage
-that group's settings, and configured `BUSINESSGPT_BOT_ADMIN_USER_IDS` are
-global recovery administrators. Private editor sessions retain the target
-group for 24 hours but re-check live group administration on every action.
-Telegram command menus are scoped similarly: ordinary group members see
-`/gpt`, while group administrators and private chats receive the management
-commands.
-
-Admin-only model commands:
+Model commands:
 
 ```text
 /models
-/model_show <name>
+/model_show [name]
 /model_use <name>
-/model_new <name> <api_url> [max_tokens] [temperature] [top_p] [top_k] [repetition_penalty]
-/model_edit <name> <api_url> [max_tokens] [temperature] [top_p] [top_k] [repetition_penalty]
+/model_new <name> <api_url> [max] [temp] [top_p] [top_k] [repeat]
+/model_edit <name> <api_url> [max] [temp] [top_p] [top_k] [repeat]
 /model_delete <name>
 ```
 
-Other admin commands:
+Only owners can run the mutation commands for models. Pending editors expire
+after 15 minutes; `/cancel` clears one immediately.
 
-```text
-/status
-/settings
-/tools
-```
+## Design Constraints
 
-For long prompt text, use a two-step flow:
+Do not move prompt editing into environment variables, Docker rebuilds, or
+mounted global prompt files. Those approaches cannot represent independent
+group presets, atomic edits, soft deletion, testing, or reaction provenance.
 
-```text
-/prompt_new drunk_short
-<next message is saved as prompt text>
-```
-
-or:
-
-```text
-/prompt_edit drunk_short
-<next message replaces prompt text>
-```
-
-## Avoid
-
-Do not make prompt editing modify env vars, Docker config, or mounted files as
-the main path. That only works for one global prompt and becomes awkward for
-per-chat presets, history, testing, delete/recover, and Telegram UX.
-
-Do not put the Telegram bot behind Caddy. Long polling keeps it private and
-avoids another public route.
+Do not persist general plaintext chat history for convenience. Context needed
+for selected training examples is already captured inside sealed per-generation
+payloads.

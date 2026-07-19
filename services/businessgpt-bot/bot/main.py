@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import shutil
 
 from telegram import (
     BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeChatMember,
     BotCommandScopeAllChatAdministrators,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
+    Update,
 )
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -16,6 +21,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     MessageReactionHandler,
+    TypeHandler,
     filters,
 )
 
@@ -25,7 +31,11 @@ from .crypto import FeedbackEncryptor
 from .context_cache import ContextCache
 from .db import BotDB
 from .media_cache import EncryptedMediaCache
+from .limits import GenerationLimiter
+from .validation import validate_allowed_api_url
 from .handlers import (
+    authorize_update,
+    cancel_command,
     error_handler,
     gpt_command,
     model_delete_command,
@@ -67,6 +77,7 @@ ADMIN_COMMANDS = [
     BotCommand("gpt", "Generate a reply"),
     BotCommand("settings", "Open chat settings"),
     BotCommand("status", "Show active configuration"),
+    BotCommand("cancel", "Cancel pending editor action"),
     BotCommand("prompts", "List prompt presets"),
     BotCommand("prompt_show", "Show a prompt preset"),
     BotCommand("prompt_use", "Select a prompt preset"),
@@ -78,6 +89,11 @@ ADMIN_COMMANDS = [
     BotCommand("models", "List model profiles"),
     BotCommand("model_show", "Show a model profile"),
     BotCommand("model_use", "Select a model profile"),
+    BotCommand("tools", "Show tool scaffolds"),
+]
+
+OWNER_COMMANDS = [
+    *ADMIN_COMMANDS,
     BotCommand("model_new", "Create a model profile"),
     BotCommand("model_edit", "Edit a model profile"),
     BotCommand("model_delete", "Delete a model profile"),
@@ -90,6 +106,13 @@ async def post_init(application: Application) -> None:
     config: Config = application.bot_data["config"]
     db: BotDB = application.bot_data["db"]
     db.migrate()
+    db.migrate_legacy_prompts(min(config.allowed_chat_ids))
+    for model in db.list_model_profiles():
+        try:
+            validate_allowed_api_url(model["api_url"], config.allowed_api_urls)
+        except ValueError:
+            logger.warning("quarantining model profile with disallowed endpoint: %s", model["name"])
+            db.soft_delete_model_profile(model["name"])
     db.seed_default_model_profile(
         api_url=config.api_url,
         max_tokens=config.default_max_tokens,
@@ -99,6 +122,10 @@ async def post_init(application: Application) -> None:
         repetition_penalty=config.default_repetition_penalty,
     )
     application.bot_data["media_cache"].cleanup()
+    _run_maintenance(application)
+    application.bot_data["maintenance_task"] = asyncio.create_task(
+        _maintenance_loop(application)
+    )
     me = await application.bot.get_me()
     application.bot_data["bot_id"] = me.id
     application.bot_data["bot_username"] = me.username
@@ -115,6 +142,19 @@ async def post_init(application: Application) -> None:
             ADMIN_COMMANDS,
             scope=BotCommandScopeAllPrivateChats(),
         )
+        for owner_user_id in config.owner_user_ids:
+            await application.bot.set_my_commands(
+                OWNER_COMMANDS,
+                scope=BotCommandScopeChat(chat_id=owner_user_id),
+            )
+            for chat_id in config.allowed_chat_ids:
+                await application.bot.set_my_commands(
+                    OWNER_COMMANDS,
+                    scope=BotCommandScopeChatMember(
+                        chat_id=chat_id,
+                        user_id=owner_user_id,
+                    ),
+                )
     except TelegramError as exc:
         logger.warning("could not register Telegram command menu: %s", exc)
     logger.info(
@@ -127,14 +167,49 @@ async def post_init(application: Application) -> None:
 async def post_shutdown(application: Application) -> None:
     api: BusinessGPTClient = application.bot_data["businessgpt"]
     db: BotDB = application.bot_data["db"]
+    maintenance_task = application.bot_data.get("maintenance_task")
+    if maintenance_task:
+        maintenance_task.cancel()
+        try:
+            await maintenance_task
+        except asyncio.CancelledError:
+            pass
     await api.close()
     db.close()
+
+
+def _run_maintenance(application: Application) -> None:
+    config: Config = application.bot_data["config"]
+    db: BotDB = application.bot_data["db"]
+    media_cache: EncryptedMediaCache = application.bot_data["media_cache"]
+    media_cache.cleanup()
+    deleted = db.prune_feedback(
+        unreacted_ttl_seconds=config.feedback_unreacted_ttl_seconds,
+        unreacted_max_rows=config.feedback_unreacted_max_rows,
+        unreacted_max_bytes=config.feedback_unreacted_max_bytes,
+        reacted_max_rows=config.feedback_reacted_max_rows,
+        reacted_max_bytes=config.feedback_reacted_max_bytes,
+        media_max_bytes=config.feedback_media_max_bytes,
+    )
+    free_bytes = shutil.disk_usage("/data").free
+    if free_bytes < config.disk_free_warning_bytes:
+        logger.warning("low bot data disk space free_bytes=%d", free_bytes)
+    if any(deleted.values()):
+        logger.info("feedback maintenance deleted=%s", deleted)
+
+
+async def _maintenance_loop(application: Application) -> None:
+    config: Config = application.bot_data["config"]
+    while True:
+        await asyncio.sleep(config.maintenance_interval_seconds)
+        await asyncio.to_thread(_run_maintenance, application)
 
 
 def build_application(config: Config) -> Application:
     builder = (
         ApplicationBuilder()
         .token(config.bot_token)
+        .concurrent_updates(8)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
     )
@@ -144,12 +219,27 @@ def build_application(config: Config) -> Application:
         )
     application = builder.build()
     application.bot_data["config"] = config
-    db = BotDB(config.db_path)
+    db = BotDB(
+        config.db_path,
+        default_recent_context_messages=config.default_recent_context_messages,
+    )
     encryptor = FeedbackEncryptor(config.feedback_public_key_b64)
     application.bot_data["db"] = db
-    application.bot_data["businessgpt"] = BusinessGPTClient(config.api_key)
+    application.bot_data["businessgpt"] = BusinessGPTClient(
+        config.api_key, config.allowed_api_urls
+    )
     application.bot_data["feedback_encryptor"] = encryptor
-    application.bot_data["context_cache"] = ContextCache(max_messages_per_chat=20)
+    application.bot_data["context_cache"] = ContextCache(
+        max_messages_per_chat=20,
+        max_chats=config.context_cache_max_chats,
+        ttl_seconds=config.context_cache_ttl_seconds,
+    )
+    application.bot_data["generation_limiter"] = GenerationLimiter(
+        max_concurrent=config.max_concurrent_generations,
+        user_requests=config.rate_limit_user_requests,
+        chat_requests=config.rate_limit_chat_requests,
+        window_seconds=config.rate_limit_window_seconds,
+    )
     application.bot_data["media_cache"] = EncryptedMediaCache(
         directory=config.media_cache_dir,
         ttl_seconds=config.media_cache_ttl_seconds,
@@ -158,9 +248,11 @@ def build_application(config: Config) -> Application:
         encryptor=encryptor,
     )
 
+    application.add_handler(TypeHandler(Update, authorize_update), group=-100)
     application.add_handler(MessageHandler(filters.ALL, remember_message), group=-1)
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("settings", settings_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("gpt", gpt_command))
     application.add_handler(CommandHandler("prompts", prompts_command))
     application.add_handler(CommandHandler("prompt_show", prompt_show_command))

@@ -60,10 +60,17 @@ def main() -> int:
     where = "" if args.include_pending else "where reaction_event_id is not null"
     conn = sqlite3.connect(args.db_path)
     conn.row_factory = sqlite3.Row
+    sample_columns = {
+        row["name"] for row in conn.execute("pragma table_info(encrypted_feedback_samples)")
+    }
+    schema_version_select = (
+        "schema_version" if "schema_version" in sample_columns else "1 as schema_version"
+    )
     rows = conn.execute(
         f"""
         select id, chat_id, telegram_message_id, reaction_event_id,
-               payload_json_sha256, encrypted_payload_b64, created_at
+               payload_json_sha256, encrypted_payload_b64, created_at,
+               {schema_version_select}
         from encrypted_feedback_samples
         {where}
         order by id
@@ -77,13 +84,35 @@ def main() -> int:
                 row["encrypted_payload_b64"],
                 args.private_key_b64,
             )
+            reaction_rows = conn.execute(
+                """
+                select id, user_id, old_reaction_json, new_reaction_json, created_at
+                from reaction_events
+                where chat_id = ? and telegram_message_id = ?
+                order by id
+                """,
+                (row["chat_id"], row["telegram_message_id"]),
+            ).fetchall()
+            reactions = [
+                {
+                    "event_id": reaction["id"],
+                    "user_id": reaction["user_id"],
+                    "old": json.loads(reaction["old_reaction_json"]),
+                    "new": json.loads(reaction["new_reaction_json"]),
+                    "created_at": reaction["created_at"],
+                }
+                for reaction in reaction_rows
+            ]
             record = {
                 "sample_id": row["id"],
+                "feedback_schema_version": row["schema_version"],
                 "chat_id": row["chat_id"],
                 "telegram_message_id": row["telegram_message_id"],
                 "reaction_event_id": row["reaction_event_id"],
                 "payload_json_sha256": row["payload_json_sha256"],
                 "created_at": row["created_at"],
+                "reaction_history": reactions,
+                "final_reaction_state": reactions[-1]["new"] if reactions else [],
                 "payload": payload,
             }
             output.write(json.dumps(record, ensure_ascii=False) + "\n")

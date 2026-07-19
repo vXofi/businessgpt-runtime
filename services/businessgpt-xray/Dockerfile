@@ -1,2 +1,2 @@
-ARG XRAY_IMAGE=ghcr.io/xtls/xray-core:26.6.1
+ARG XRAY_IMAGE=ghcr.io/xtls/xray-core:26.6.1@sha256:3943bddece5fab72308a4415917f0391917b7b81ddbf50708988b89e6e2bd213
 FROM ${XRAY_IMAGE}

@@ -2,12 +2,7 @@ notes.example.com {
     reverse_proxy service-a:5984
 }
 
-businessgpt-api.example.com {
-    reverse_proxy businessgpt-api:8000
-}
-
 # Future service example:
 # service1.example.com {
 #     reverse_proxy service1:3000
 # }
-

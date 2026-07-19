@@ -1,12 +1,7 @@
-FROM python:3.11-slim
+ARG PYTHON_IMAGE=python:3.11-slim@sha256:b27df5841f3355e9473f9a516d38a6783b6c8dfeacaf2d14a240f443b368ddb6
+FROM ${PYTHON_IMAGE} AS llama-builder
 
 ARG LLAMA_CPP_REF=a4107133a634250c8c9d888bc0bc8520dcfd6105
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    HOST=0.0.0.0 \
-    PORT=8000 \
-    CMAKE_BUILD_PARALLEL_LEVEL=2
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential ca-certificates cmake git \
@@ -18,15 +13,36 @@ RUN git init /opt/llama.cpp \
     && git -C /opt/llama.cpp checkout --detach FETCH_HEAD \
     && cmake -B /opt/llama.cpp/build -S /opt/llama.cpp \
         -DCMAKE_BUILD_TYPE=MinSizeRel \
+        -DBUILD_SHARED_LIBS=OFF \
         -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
     && cmake --build /opt/llama.cpp/build --target llama-server llama-quantize -j2
 
+FROM ${PYTHON_IMAGE}
+
+ARG LLAMA_CPP_REF=a4107133a634250c8c9d888bc0bc8520dcfd6105
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/tmp \
+    HOST=0.0.0.0 \
+    PORT=8000 \
+    LLAMA_CPP_REF=${LLAMA_CPP_REF} \
+    LLAMA_SERVER_BIN=/usr/local/bin/llama-server
+
+RUN groupadd --gid 10001 businessgpt \
+    && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin businessgpt
+
+COPY --from=llama-builder /opt/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
+COPY --from=llama-builder /opt/llama.cpp/build/bin/llama-quantize /usr/local/bin/llama-quantize
+COPY --from=llama-builder /usr/lib/x86_64-linux-gnu/libgomp.so.1* /usr/lib/x86_64-linux-gnu/
+
 WORKDIR /app
-COPY services/businessgpt-api/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.lock ./requirements.lock
+RUN pip install --no-cache-dir -r requirements.lock
 
-COPY services/businessgpt-api/server.py ./server.py
-COPY services/businessgpt-api/context_window.py ./context_window.py
-COPY services/businessgpt-api/media.py ./media.py
+COPY server.py context_window.py media.py api_security.py request_models.py model_verification.py ./
+COPY model-manifest.json ./model-manifest.json
 
-CMD ["sh", "-c", "uvicorn server:app --host ${HOST} --port ${PORT} --workers 1"]
+USER 10001:10001
+
+CMD ["sh", "-c", "exec python -m uvicorn server:app --host \"$HOST\" --port \"$PORT\" --workers 1 --no-server-header --timeout-keep-alive 5 --h11-max-incomplete-event-size 16384"]

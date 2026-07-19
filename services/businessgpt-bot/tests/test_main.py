@@ -1,6 +1,6 @@
 import unittest
 
-from bot.main import ADMIN_COMMANDS, ALLOWED_UPDATES, GROUP_COMMANDS
+from bot.main import ADMIN_COMMANDS, ALLOWED_UPDATES, GROUP_COMMANDS, OWNER_COMMANDS
 
 
 class MainConfigurationTests(unittest.TestCase):
@@ -12,7 +12,11 @@ class MainConfigurationTests(unittest.TestCase):
         admin_names = [command.command for command in ADMIN_COMMANDS]
         self.assertIn("settings", admin_names)
         self.assertIn("status", admin_names)
+        self.assertNotIn("model_edit", admin_names)
         self.assertEqual(len(admin_names), len(set(admin_names)))
+        owner_names = [command.command for command in OWNER_COMMANDS]
+        self.assertIn("model_edit", owner_names)
+        self.assertEqual(len(owner_names), len(set(owner_names)))
 
 
 if __name__ == "__main__":

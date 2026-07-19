@@ -50,6 +50,14 @@ class EncryptedMediaCache:
             )
             total -= int(row["encrypted_bytes"])
 
+        referenced = {
+            str(Path(row["encrypted_path"]).resolve())
+            for row in self.db.list_pending_feedback_media()
+        }
+        for path in self.directory.glob("*.sealed"):
+            if str(path.resolve()) not in referenced:
+                path.unlink(missing_ok=True)
+
     def store(
         self,
         *,

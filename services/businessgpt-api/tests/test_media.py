@@ -29,6 +29,11 @@ class MediaTests(unittest.TestCase):
         with self.assertRaises(ImageValidationError):
             normalize_image_data_url("https://example.com/image.jpg")
 
+    def test_rejects_mime_type_mismatch(self) -> None:
+        value = image_data_url("PNG", (8, 8)).replace("image/png", "image/jpeg", 1)
+        with self.assertRaisesRegex(ImageValidationError, "does not match"):
+            normalize_image_data_url(value)
+
 
 if __name__ == "__main__":
     unittest.main()

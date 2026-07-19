@@ -1,8 +1,12 @@
+import os
+
 import requests
 
 
-BUSINESSGPT_URL = "https://businessgpt-api.example.com/generate"
-BUSINESSGPT_API_KEY = "replace-with-token"
+BUSINESSGPT_URL = os.environ.get(
+    "BUSINESSGPT_API_URL", "http://businessgpt-api:8000/generate"
+)
+BUSINESSGPT_API_KEY = os.environ["BUSINESSGPT_API_KEY"]
 
 
 def ask_businessgpt(messages, system_prompt=None, max_tokens=128, temperature=0.9):
@@ -22,7 +26,7 @@ def ask_businessgpt(messages, system_prompt=None, max_tokens=128, temperature=0.
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=180,
+        timeout=310,
     )
     response.raise_for_status()
     return response.json()["response"]

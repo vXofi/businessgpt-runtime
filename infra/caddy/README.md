@@ -1,57 +1,39 @@
 # Caddy
 
-Use one Caddy container as the public edge proxy for the whole VM.
+Use the existing `caddy` container as the VM's only public reverse
+proxy. It publishes ports `80` and `443` and joins Docker network `edge` with
+web applications that need a public hostname.
 
-Current production Caddy appears to be the Service A Caddy container:
-
-```text
-caddy
-```
-
-Do not run a separate `businessgpt-caddy` on ports `80`/`443`; it will conflict
-with the existing Caddy.
-
-## Production Config Path
-
-The current Caddyfile on the VM is expected at:
+Production config path:
 
 ```text
 /etc/caddy/Caddyfile
 ```
 
-After editing it, reload:
+Validate and reload after editing:
 
 ```bash
+docker exec caddy caddy validate --config /etc/caddy/Caddyfile
 docker exec caddy caddy reload --config /etc/caddy/Caddyfile
 ```
 
-## Private Docker Networking
+The Caddyfile is bind-mounted read-only. Edit its existing inode in place; an
+atomic rename can leave a running container attached to the old inode. If an
+editor replaces the file, restart `caddy` once before validating so
+Docker remounts the current host path. The BusinessGPT hardening helper handles
+both cases and keeps at most seven timestamped Caddy backups.
 
-Caddy must share a Docker network with the services it proxies:
-
-```bash
-docker network create edge
-docker network connect edge caddy
-docker network connect edge businessgpt-api
-docker network connect edge service-a
-```
-
-Then Caddy can route to container names:
+Example public route:
 
 ```caddyfile
-businessgpt-api.example.com {
-    reverse_proxy businessgpt-api:8000
+service-b.example.com {
+    reverse_proxy service-b:8080
 }
 ```
 
-## Public Ports
+Caddy and the target container must both join `edge`; the application port must
+not be published on the host.
 
-Only these should be public:
-
-```text
-80/tcp
-443/tcp
-```
-
-Close public `8000/tcp` after local routing works.
-
+BusinessGPT is intentionally different. `businessgpt-api`, `businessgpt-bot`,
+and `businessgpt-xray` use isolated service networks and must not join `edge`.
+There is no `businessgpt-api.example.com` Caddy block in the hardened architecture.

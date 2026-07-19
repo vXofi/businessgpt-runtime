@@ -7,16 +7,28 @@ from bot.db import BotDB
 
 
 class BotDBTest(unittest.TestCase):
+    def test_prompt_presets_are_scoped_per_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = BotDB(str(Path(tmp) / "bot.sqlite3"))
+            db.migrate()
+            first = db.upsert_prompt(chat_id=-1, name="same", text="one", created_by=1)
+            second = db.upsert_prompt(chat_id=-2, name="same", text="two", created_by=2)
+            self.assertNotEqual(first["id"], second["id"])
+            self.assertEqual(db.get_prompt_by_name(-1, "same")["text"], "one")
+            self.assertEqual(db.get_prompt_by_name(-2, "same")["text"], "two")
+            self.assertIsNone(db.get_prompt_by_id(-2, first["id"]))
+            db.close()
+
     def test_migrations_and_prompt_soft_delete(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = BotDB(str(Path(tmp) / "bot.sqlite3"))
             db.migrate()
-            prompt = db.upsert_prompt(name="test", text="hello", created_by=1)
+            prompt = db.upsert_prompt(chat_id=-100, name="test", text="hello", created_by=1)
             self.assertEqual(prompt["name"], "test")
-            db.set_active_prompt(100, prompt["id"])
-            self.assertEqual(db.get_active_prompt(100)["text"], "hello")
-            self.assertTrue(db.soft_delete_prompt("test"))
-            self.assertIsNone(db.get_active_prompt(100))
+            db.set_active_prompt(-100, prompt["id"])
+            self.assertEqual(db.get_active_prompt(-100)["text"], "hello")
+            self.assertTrue(db.soft_delete_prompt(-100, "test"))
+            self.assertIsNone(db.get_active_prompt(-100))
             db.close()
 
     def test_default_model_profile(self):
@@ -137,8 +149,87 @@ class BotDBTest(unittest.TestCase):
             db.migrate()
 
             settings = db.get_chat_settings(99)
-            self.assertEqual(settings["recent_context_messages"], 0)
+            self.assertEqual(settings["recent_context_messages"], 10)
             self.assertIn("top_k", settings.keys())
+            db.close()
+
+    def test_pending_actions_expire_without_being_popped_early(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = BotDB(str(Path(tmp) / "bot.sqlite3"))
+            db.migrate()
+            db.set_pending_action(
+                chat_id=1,
+                user_id=2,
+                target_chat_id=-3,
+                action="prompt_text",
+                target_name="test",
+            )
+            self.assertIsNotNone(db.get_pending_action(chat_id=1, user_id=2))
+            self.assertIsNotNone(db.get_pending_action(chat_id=1, user_id=2))
+            db._conn.execute(
+                "update pending_admin_actions set created_at = '2000-01-01T00:00:00+00:00'"
+            )
+            db._conn.commit()
+            self.assertIsNone(db.get_pending_action(chat_id=1, user_id=2, ttl_seconds=1))
+            db.close()
+
+    def test_feedback_retention_preserves_reacted_context_under_caps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = BotDB(str(Path(tmp) / "bot.sqlite3"))
+            db.migrate()
+            for message_id in range(3):
+                db.insert_encrypted_feedback_sample(
+                    chat_id=-1,
+                    telegram_message_id=message_id,
+                    payload={"messages": ["context"]},
+                    encrypted_payload_b64="x" * 10,
+                )
+            event_id = db.insert_reaction_event(
+                chat_id=-1,
+                telegram_message_id=2,
+                user_id=4,
+                old_reaction=[],
+                new_reaction=["like"],
+            )
+            self.assertGreater(event_id, 0)
+            db.prune_feedback(
+                unreacted_ttl_seconds=3600,
+                unreacted_max_rows=1,
+                unreacted_max_bytes=100,
+                reacted_max_rows=10,
+                reacted_max_bytes=100,
+                media_max_bytes=100,
+            )
+            stats = db.feedback_stats()
+            self.assertEqual(stats["unreacted_rows"], 1)
+            self.assertEqual(stats["reacted_rows"], 1)
+            db.close()
+
+    def test_feedback_retention_deletes_large_sets_in_bounded_batches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = BotDB(str(Path(tmp) / "bot.sqlite3"))
+            db.migrate()
+            db._conn.executemany(
+                """
+                insert into encrypted_feedback_samples(
+                    chat_id, telegram_message_id, payload_json_sha256,
+                    encrypted_payload_b64, encrypted_bytes, schema_version, created_at
+                ) values (-1, ?, 'hash', 'sealed', 6, 2, '2026-01-01T00:00:00+00:00')
+                """,
+                ((message_id,) for message_id in range(1200)),
+            )
+            db._conn.commit()
+
+            db.prune_feedback(
+                unreacted_ttl_seconds=10**9,
+                unreacted_max_rows=1,
+                unreacted_max_bytes=100,
+                reacted_max_rows=1,
+                reacted_max_bytes=100,
+                media_max_bytes=100,
+            )
+
+            self.assertEqual(db.feedback_stats()["unreacted_rows"], 1)
             db.close()
 
 

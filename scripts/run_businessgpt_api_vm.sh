@@ -1,10 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${BUSINESSGPT_API_KEY:?Set BUSINESSGPT_API_KEY before running}"
+env_file="${BUSINESSGPT_API_ENV_FILE:-/opt/businessgpt/api.env}"
+network="${BUSINESSGPT_BACKEND_NETWORK:-businessgpt-backend}"
 
-model_path="${BUSINESSGPT_MODEL_PATH:-/models/model-Q5_K_M-no-mtp.gguf}"
-mmproj_path="${BUSINESSGPT_MMPROJ_PATH:-}"
+[[ -f "$env_file" ]] || { echo "Missing API env file: $env_file" >&2; exit 1; }
+[[ "$(stat -c '%a' "$env_file")" =~ ^(400|600)$ ]] || {
+  echo "API env file must have mode 0600 or 0400: $env_file" >&2
+  exit 1
+}
+grep -Eq '^BUSINESSGPT_API_KEY=.+$' "$env_file" || {
+  echo "BUSINESSGPT_API_KEY is missing from $env_file" >&2
+  exit 1
+}
+
+env_value() {
+  local name="$1"
+  local fallback="$2"
+  local value
+  value="$(awk -v key="$name" 'index($0, key "=") == 1 { print substr($0, length(key) + 2); exit }' "$env_file")"
+  printf '%s' "${value:-$fallback}"
+}
+
+model_path="$(env_value BUSINESSGPT_MODEL_PATH /models/model-Q5_K_M-no-mtp.gguf)"
+mmproj_path="$(env_value BUSINESSGPT_MMPROJ_PATH '')"
 host_model="/opt/businessgpt/models/${model_path##*/}"
 [[ -f "$host_model" ]] || { echo "Missing model: $host_model" >&2; exit 1; }
 if [[ -n "$mmproj_path" ]]; then
@@ -13,27 +32,30 @@ if [[ -n "$mmproj_path" ]]; then
 fi
 docker image inspect businessgpt-api:llama-server >/dev/null
 
-docker network inspect edge >/dev/null 2>&1 || docker network create edge
-
+docker network inspect "$network" >/dev/null 2>&1 \
+  || docker network create --internal "$network" >/dev/null
 docker rm -f businessgpt-api >/dev/null 2>&1 || true
+health_cmd='python -c '\''import json,urllib.request; assert json.load(urllib.request.urlopen("http://127.0.0.1:8000/health",timeout=2))["ok"]'\'''
 
-docker_args=(run -d --name businessgpt-api --restart unless-stopped \
-  --network edge \
-  -e BUSINESSGPT_MODEL_PATH="$model_path" \
-  -e BUSINESSGPT_MMPROJ_PATH="$mmproj_path" \
-  -e BUSINESSGPT_API_KEY="${BUSINESSGPT_API_KEY}" \
-  -e BUSINESSGPT_N_CTX="${BUSINESSGPT_N_CTX:-4096}" \
-  -e BUSINESSGPT_CONTEXT_SAFETY_TOKENS="${BUSINESSGPT_CONTEXT_SAFETY_TOKENS:-16}" \
-  -e BUSINESSGPT_N_THREADS="${BUSINESSGPT_N_THREADS:-8}" \
-  -e BUSINESSGPT_N_GPU_LAYERS="${BUSINESSGPT_N_GPU_LAYERS:-0}" \
-  -e BUSINESSGPT_N_PARALLEL="${BUSINESSGPT_N_PARALLEL:-1}" \
-  -e BUSINESSGPT_IMAGE_MAX_TOKENS="${BUSINESSGPT_IMAGE_MAX_TOKENS:-1024}" \
-  -e BUSINESSGPT_STARTUP_TIMEOUT_SECONDS="${BUSINESSGPT_STARTUP_TIMEOUT_SECONDS:-900}" \
-  -v /opt/businessgpt/models:/models:ro)
+docker create --name businessgpt-api --restart unless-stopped \
+  --network "$network" \
+  --env-file "$env_file" \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --pids-limit "${BUSINESSGPT_API_PIDS_LIMIT:-256}" \
+  --memory "${BUSINESSGPT_API_MEMORY_LIMIT:-24g}" \
+  --memory-swap "${BUSINESSGPT_API_MEMORY_LIMIT:-24g}" \
+  --cpus "${BUSINESSGPT_API_CPU_LIMIT:-8}" \
+  --log-opt max-size=10m \
+  --log-opt max-file=3 \
+  --health-cmd "$health_cmd" \
+  --health-interval 30s \
+  --health-timeout 3s \
+  --health-retries 3 \
+  -v /opt/businessgpt/models:/models:ro \
+  businessgpt-api:llama-server >/dev/null
 
-if [[ -n "${BUSINESSGPT_SYSTEM_PROMPT+x}" ]]; then
-  docker_args+=(-e BUSINESSGPT_SYSTEM_PROMPT="$BUSINESSGPT_SYSTEM_PROMPT")
-fi
-
-docker_args+=(businessgpt-api:llama-server)
-docker "${docker_args[@]}"
+docker start businessgpt-api >/dev/null
+docker inspect businessgpt-api --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'

@@ -1,33 +1,54 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${BUSINESSGPT_BOT_TOKEN:?Set BUSINESSGPT_BOT_TOKEN before running}"
-: "${BUSINESSGPT_BOT_ADMIN_USER_IDS:?Set BUSINESSGPT_BOT_ADMIN_USER_IDS before running}"
-: "${BUSINESSGPT_API_KEY:?Set BUSINESSGPT_API_KEY before running}"
-: "${BUSINESSGPT_BOT_FEEDBACK_PUBLIC_KEY_B64:?Set BUSINESSGPT_BOT_FEEDBACK_PUBLIC_KEY_B64 before running}"
+env_file="${BUSINESSGPT_BOT_ENV_FILE:-/opt/businessgpt-bot/bot.env}"
+backend_network="${BUSINESSGPT_BACKEND_NETWORK:-businessgpt-backend}"
+proxy_network="${BUSINESSGPT_PROXY_NETWORK:-businessgpt-proxy}"
+data_dir="/opt/businessgpt-bot/data"
 
-docker network inspect edge >/dev/null 2>&1 || docker network create edge
-mkdir -p /opt/businessgpt-bot/data
+[[ -f "$env_file" ]] || { echo "Missing bot env file: $env_file" >&2; exit 1; }
+[[ "$(stat -c '%a' "$env_file")" =~ ^(400|600)$ ]] || {
+  echo "Bot env file must have mode 0600 or 0400: $env_file" >&2
+  exit 1
+}
+for name in \
+  BUSINESSGPT_BOT_TOKEN \
+  BUSINESSGPT_BOT_OWNER_USER_IDS \
+  BUSINESSGPT_BOT_ALLOWED_CHAT_IDS \
+  BUSINESSGPT_API_KEY \
+  BUSINESSGPT_BOT_FEEDBACK_PUBLIC_KEY_B64
+do
+  grep -Eq "^${name}=.+$" "$env_file" || {
+    echo "$name is missing from $env_file" >&2
+    exit 1
+  }
+done
+
+docker image inspect businessgpt-bot:latest >/dev/null
+docker network inspect "$backend_network" >/dev/null 2>&1 \
+  || docker network create --internal "$backend_network" >/dev/null
+docker network inspect "$proxy_network" >/dev/null 2>&1 \
+  || docker network create --internal "$proxy_network" >/dev/null
+mkdir -p "$data_dir"
+docker run --rm --user 0:0 --entrypoint chown \
+  -v "$data_dir:/data" businessgpt-bot:latest -R 10001:10001 /data
 
 docker rm -f businessgpt-bot >/dev/null 2>&1 || true
-
-docker run -d --name businessgpt-bot --restart unless-stopped \
-  --network edge \
-  -e BUSINESSGPT_BOT_TOKEN="${BUSINESSGPT_BOT_TOKEN}" \
-  -e BUSINESSGPT_BOT_ADMIN_USER_IDS="${BUSINESSGPT_BOT_ADMIN_USER_IDS}" \
-  -e BUSINESSGPT_BOT_TELEGRAM_PROXY_URL="${BUSINESSGPT_BOT_TELEGRAM_PROXY_URL:-}" \
-  -e BUSINESSGPT_API_URL="${BUSINESSGPT_API_URL:-http://businessgpt-api:8000/generate}" \
-  -e BUSINESSGPT_API_KEY="${BUSINESSGPT_API_KEY}" \
-  -e BUSINESSGPT_BOT_DB_PATH="${BUSINESSGPT_BOT_DB_PATH:-/data/bot.sqlite3}" \
-  -e BUSINESSGPT_BOT_MEDIA_CACHE_DIR="${BUSINESSGPT_BOT_MEDIA_CACHE_DIR:-/data/pending-media}" \
-  -e BUSINESSGPT_BOT_MEDIA_CACHE_TTL_SECONDS="${BUSINESSGPT_BOT_MEDIA_CACHE_TTL_SECONDS:-86400}" \
-  -e BUSINESSGPT_BOT_MEDIA_CACHE_MAX_BYTES="${BUSINESSGPT_BOT_MEDIA_CACHE_MAX_BYTES:-268435456}" \
-  -e BUSINESSGPT_BOT_IMAGE_MAX_BYTES="${BUSINESSGPT_BOT_IMAGE_MAX_BYTES:-10485760}" \
-  -e BUSINESSGPT_BOT_FEEDBACK_PUBLIC_KEY_B64="${BUSINESSGPT_BOT_FEEDBACK_PUBLIC_KEY_B64}" \
-  -e BUSINESSGPT_BOT_MAX_TOKENS="${BUSINESSGPT_BOT_MAX_TOKENS:-128}" \
-  -e BUSINESSGPT_BOT_TEMPERATURE="${BUSINESSGPT_BOT_TEMPERATURE:-0.9}" \
-  -e BUSINESSGPT_BOT_TOP_P="${BUSINESSGPT_BOT_TOP_P:-0.9}" \
-  -e BUSINESSGPT_BOT_TOP_K="${BUSINESSGPT_BOT_TOP_K:-50}" \
-  -e BUSINESSGPT_BOT_REPETITION_PENALTY="${BUSINESSGPT_BOT_REPETITION_PENALTY:-1.2}" \
-  -v /opt/businessgpt-bot/data:/data \
-  businessgpt-bot:latest
+docker create --name businessgpt-bot --restart unless-stopped \
+  --network "$backend_network" \
+  --env-file "$env_file" \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --pids-limit "${BUSINESSGPT_BOT_PIDS_LIMIT:-128}" \
+  --memory "${BUSINESSGPT_BOT_MEMORY_LIMIT:-512m}" \
+  --memory-swap "${BUSINESSGPT_BOT_MEMORY_LIMIT:-512m}" \
+  --cpus "${BUSINESSGPT_BOT_CPU_LIMIT:-1}" \
+  --log-opt max-size=10m \
+  --log-opt max-file=3 \
+  -v "$data_dir:/data" \
+  businessgpt-bot:latest >/dev/null
+docker network connect "$proxy_network" businessgpt-bot
+docker start businessgpt-bot >/dev/null
+docker inspect businessgpt-bot --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'

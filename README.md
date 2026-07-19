@@ -1,212 +1,235 @@
 # BusinessGPT Runtime
 
-Infrastructure and deploy repo for services hosted on the deployment VM.
+Infrastructure and deployment repository for the deployment VM. BusinessGPT model
+training lives elsewhere; this repository owns runtime images, private service
+networks, Caddy routes, and operational scripts.
 
-This repo is intentionally separate from the BusinessGPT training repo. It owns
-runtime services, routing, Docker images, and operational notes. It must not
-contain datasets, model artifacts, generations, notebooks, API keys, bot tokens,
-or Hugging Face tokens.
+Do not commit secrets, model files, datasets, generated samples, databases, or
+VLESS links.
 
-## Current Services
+## Current Shape
 
-| Domain | Service | Container | Public port |
-| --- | --- | --- | --- |
-| `businessgpt-api.example.com` | BusinessGPT inference API | `businessgpt-api` | via Caddy `443` |
-| none | BusinessGPT Telegram bot | `businessgpt-bot` | none |
-| `notes.example.com` | service A service-a | `service-a` | via Caddy `443` |
+| Public name | Service | Container |
+| --- | --- | --- |
+| `notes.example.com` | service A | `service-a` |
+| `service-b.example.com` | service B | `service-b` |
+| none | BusinessGPT API | `businessgpt-api` |
+| none | BusinessGPT Telegram bot | `businessgpt-bot` |
 
-Public traffic should enter through one Caddy container on ports `80` and `443`.
-Application containers should stay on a private Docker network.
-
-## Target Architecture
+Only Caddy publishes host ports `80` and `443`. The BusinessGPT API is not a
+public service and has no Caddy route.
 
 ```text
-internet
-  |
-  | 80/443
-  v
-caddy edge proxy
-  |-- businessgpt-api.example.com      -> businessgpt-api:8000
-  |-- notes.example.com -> service-a:5984
-  |-- service1.example.com -> service1:<private-port>
-  |-- service2.example.com -> service2:<private-port>
+internet -> caddy -> edge -> public web application containers
 
-businessgpt-bot uses Telegram long polling and calls businessgpt-api over edge.
-It does not need a public domain or Caddy route.
+businessgpt-bot -> businessgpt-backend (internal) -> businessgpt-api
+businessgpt-bot -> businessgpt-proxy (internal) -> businessgpt-xray
+businessgpt-xray -> businessgpt-egress -> Telegram through VLESS
 ```
 
-Do not expose service ports publicly unless this is a short debug session.
+The isolated BusinessGPT networks prevent Caddy, service-a, and unrelated web
+containers from reaching the inference API or its SOCKS proxy.
 
-## Repo Layout
+## Repository Layout
 
 ```text
-services/businessgpt-api/  FastAPI wrapper around llama-server
-services/businessgpt-bot/  Telegram bot for prompts, model profiles, reactions
-infra/caddy/               Caddy examples and routing notes
-docs/                      New-chat context and operational notes
-scripts/                   Local build and VM deploy helpers
-examples/                  Client snippets for integrations
+services/businessgpt-api/   FastAPI wrapper plus native llama.cpp server
+services/businessgpt-bot/   Telegram bot, settings, and encrypted feedback
+services/businessgpt-xray/  Pinned Xray egress image
+infra/caddy/                Public reverse-proxy examples
+docs/                       Architecture and handoff notes
+scripts/                    Local builds, VM updates, exports, and recovery
 ```
 
 ## SSH Usage
 
-Connect directly to the VM:
+Direct connection:
 
 ```bash
-ssh -i ~/.ssh/<key-file> deploy@192.0.2.10
+ssh -i ~/.ssh/businessgpt_ed25519 deploy@192.0.2.10
 ```
 
-Or add the example host from `scripts/ssh_config.example` to your SSH config,
-then use the short alias:
+With the host entry from `scripts/ssh_config.example` installed in
+`~/.ssh/config`:
 
 ```bash
 ssh businessgpt
-```
-
-Run one command remotely without opening an interactive shell:
-
-```bash
 ssh businessgpt 'docker ps'
-ssh businessgpt 'cd /opt/businessgpt && docker logs --tail=100 businessgpt-api'
+ssh businessgpt 'docker logs --tail=100 businessgpt-bot'
 ```
 
-Copy files to the VM:
+Copy to a user-writable application directory, not directly into a root-owned
+path:
 
 ```bash
-scp -i ~/.ssh/<key-file> businessgpt-api.tar.gz deploy@192.0.2.10:/opt/businessgpt/
-scp businessgpt-api.tar.gz businessgpt:/opt/businessgpt/
+scp -i ~/.ssh/businessgpt_ed25519 businessgpt-api.tar.gz \
+  deploy@192.0.2.10:/opt/businessgpt/
+scp businessgpt-bot.tar.gz businessgpt:/opt/businessgpt-bot/
 ```
 
-## First Setup On VM
+## BusinessGPT Runtime
 
-Create a shared private network if it does not exist:
+The API uses native `llama-server`, not `llama-cpp-python`. The image pins
+llama.cpp commit `a4107133a634250c8c9d888bc0bc8520dcfd6105`; model and projector
+hashes are pinned in `services/businessgpt-api/model-manifest.json` and verified
+at every startup.
 
-```bash
-docker network create edge
+Production model files on the VM:
+
+```text
+/opt/businessgpt/models/model-Q5_K_M-no-mtp.gguf
+/opt/businessgpt/models/mmproj-businessgpt-v16-f16.gguf
 ```
 
-Connect existing containers:
-
-```bash
-docker network connect edge caddy
-docker network connect edge businessgpt-api
-```
-
-If a container is already connected, Docker will print an error. That is not
-dangerous.
-
-## BusinessGPT API
-
-The runtime is native llama.cpp, not `llama-cpp-python`. The Qwen3.5 v16
-language GGUF and base-model vision projector are pinned in
-`services/businessgpt-api/model-manifest.json`. `llama-cpp-python` has
-multimodal support, but the native server is used here so its exact backend
-revision can be pinned and tested directly with these artifacts.
-
-Prepare the projector locally before enabling vision:
-
-```bash
-scripts/prepare_businessgpt_language_gguf.sh
-scripts/prepare_businessgpt_mmproj.sh
-```
-
-Build locally for the deployment VM:
+Build both application images locally for the amd64 VM:
 
 ```bash
 scripts/build_businessgpt_api_amd64.sh
-```
-
-After the first deployment, API-only code updates are one command:
-
-```bash
-scripts/deploy_businessgpt_api.sh
-```
-
-Copy the resulting image archive to the VM:
-
-```bash
-scp -i ~/.ssh/<key-file> businessgpt-api.tar.gz deploy@192.0.2.10:/opt/businessgpt/
-```
-
-Load and run on the VM:
-
-```bash
-cd /opt/businessgpt
-gunzip -c businessgpt-api.tar.gz | docker load
-scripts/run_businessgpt_api_vm.sh
-```
-
-## BusinessGPT Telegram Bot
-
-Build locally for the deployment VM:
-
-```bash
 scripts/build_businessgpt_bot_amd64.sh
 ```
 
-After the first deployment, bot-only updates are one command:
+The service-specific Docker contexts are deny-by-default. Local `.env` files,
+databases, and `.artifacts` are not sent to Docker during these builds.
+
+## Harden Existing VM
+
+For a legacy public/flat-network deployment, run once from the Mac:
 
 ```bash
+scripts/deploy_businessgpt_hardening.sh
+```
+
+This command:
+
+1. builds the API, bot, and pinned Xray images locally;
+2. uploads images and VM helpers;
+3. writes mode-`0600` API and bot env files without printing secrets;
+4. discovers the existing group ID and rotates the shared API key;
+5. moves BusinessGPT onto three purpose-specific Docker networks;
+6. runs both containers as UID/GID `10001` with read-only root filesystems;
+7. removes `businessgpt-api.example.com` from Caddy;
+8. restores containers, env, SQLite, and Caddy automatically on failure.
+
+The transaction retains a consistent SQLite and Caddy snapshot under
+`/opt/businessgpt-bot/hardening-backups/`. Secret-bearing pre-hardening containers
+are deleted only after all checks pass.
+
+## Routine Updates
+
+After hardening, code-only updates stay service-specific:
+
+```bash
+scripts/deploy_businessgpt_api.sh
 scripts/deploy_businessgpt_bot.sh
 ```
 
-The automated updater backs up SQLite, preserves the previous container, checks
-real application readiness, and rolls back automatically on failure.
+Both scripts build locally, upload an image archive, keep two rollback
+containers, and verify readiness. Bot updates also create a SQLite backup and
+retain the seven newest update backups.
 
-Copy the image archive and VM run helper:
-
-```bash
-ssh -i ~/.ssh/<key-file> deploy@192.0.2.10 'mkdir -p /opt/businessgpt-bot'
-scp -i ~/.ssh/<key-file> businessgpt-bot.tar.gz scripts/run_businessgpt_bot_vm.sh \
-  deploy@192.0.2.10:/opt/businessgpt-bot/
-```
-
-Load and run on the VM:
+Override the connection without editing scripts:
 
 ```bash
-cd /opt/businessgpt-bot
-gunzip -c businessgpt-bot.tar.gz | docker load
-chmod +x run_businessgpt_bot_vm.sh
-
-export BUSINESSGPT_BOT_TOKEN='<telegram-bot-token>'
-export BUSINESSGPT_BOT_ADMIN_USER_IDS='<your-telegram-user-id>'
-export BUSINESSGPT_BOT_TELEGRAM_PROXY_URL='socks5://businessgpt-xray:1080'
-export BUSINESSGPT_API_KEY='<same-token-used-by-businessgpt-api>'
-export BUSINESSGPT_BOT_FEEDBACK_PUBLIC_KEY_B64='<public-key-from-your-pc>'
-
-./run_businessgpt_bot_vm.sh
+BUSINESSGPT_DEPLOY_TARGET=user@host \
+BUSINESSGPT_SSH_KEY=~/.ssh/server-key \
+scripts/deploy_businessgpt_bot.sh
 ```
 
-The bot uses long polling, publishes no ports, and stores its SQLite DB under
-`/opt/businessgpt-bot/data`. On networks that block Telegram, use the private
-Xray/VLESS sidecar documented in `services/businessgpt-bot/README.md`; do not
-route the whole VM through the tunnel.
+Model uploads remain explicit and are never part of code-only deploys.
 
-After deployment, use `/settings` in the Telegram group for prompt, endpoint,
-context, and sampling controls. JPEG/PNG/WebP input is handled only on explicit
-`/gpt`, mention, or reply triggers.
+## Runtime Configuration
 
-## Caddy
-
-The current production Caddy config is managed by the existing Service A Caddy
-container. Update that Caddyfile rather than running a second public Caddy.
-
-Expected path on VM:
+Production configuration is stored here:
 
 ```text
-/etc/caddy/Caddyfile
+/opt/businessgpt/api.env
+/opt/businessgpt-bot/bot.env
 ```
 
-Reload:
+Both files must be mode `0600` or `0400`. Use `.env.example` only as a key
+reference; its required secret and identity values are intentionally empty.
+
+Do not export tokens in literal shell commands. For manual entry, use a hidden
+prompt and write the private file with an editor or the migration helper.
+
+Required bot policy:
+
+- `BUSINESSGPT_BOT_OWNER_USER_IDS` identifies global infrastructure owners.
+- `BUSINESSGPT_BOT_ALLOWED_CHAT_IDS` is an explicit negative-ID group allowlist.
+- Telegram group owners/admins manage prompts and generation settings only for
+  their own allowed group.
+- Only configured owners can create, edit, or delete global model endpoints.
+- Every endpoint must exactly match `BUSINESSGPT_BOT_ALLOWED_API_URLS` before
+  the bearer key is attached.
+
+## Telegram Usage
+
+The bot answers `/gpt`, replies to the bot, mentions, and supported image
+triggers. JPEG, PNG, and WebP inputs are limited to 10 MB. Generated `@`
+characters are stripped to avoid username notifications.
+
+Use these first:
+
+```text
+/status
+/settings
+/gpt test
+```
+
+`/settings` exposes per-group prompt selection and preview, model selection,
+context depth (`0`, `5`, `10`, or `20`), and bounded sampling controls. Prompt
+presets are scoped per group. Pending two-message editors expire after 15
+minutes and can be cancelled with `/cancel`.
+
+The default context depth is 10 recent messages. The live context cache is RAM
+only, limited by chat count and TTL, and cleared on restart.
+
+## Encrypted Feedback
+
+Every answer gets an encrypted generation sample so a later Telegram reaction
+can select it for training. Schema v2 records the exact prompt, complete request
+context, generation settings, model/projector hashes, context-fit decisions,
+response, and complete reaction transition history.
+
+- Unreacted samples: 7-day TTL, 5,000-row/512 MiB caps.
+- Reacted samples: retained up to 50,000 rows or 4 GiB.
+- Reacted encrypted image media: retained up to 2 GiB.
+- Pending encrypted image media: 24-hour TTL and 256 MiB cache cap.
+
+The VM stores only the sealed-box public key. Keep the private key on the PC.
+See `services/businessgpt-bot/README.md` for backup and export commands.
+
+## Verification
+
+On the VM:
 
 ```bash
-docker exec caddy caddy reload --config /etc/caddy/Caddyfile
+docker ps --filter name=businessgpt \
+  --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+docker inspect businessgpt-api \
+  --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'
+docker inspect businessgpt-bot \
+  --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'
+docker logs --tail=100 businessgpt-api
+docker logs --tail=100 businessgpt-bot
 ```
+
+Expected networks:
+
+```text
+businessgpt-api:   businessgpt-backend
+businessgpt-bot:   businessgpt-backend businessgpt-proxy
+businessgpt-xray:  businessgpt-egress businessgpt-proxy
+```
+
+No BusinessGPT container should be attached to `edge` or publish a host port.
 
 ## Security Rules
 
-- Public Yandex security group: allow TCP `80` and `443`.
-- Restrict SSH `22` to your own IP.
-- Close public `8000`.
-- Use `BUSINESSGPT_API_KEY` for `/generate`.
-- Keep secrets in VM env files or shell history-conscious commands, not in git.
+- Public security group: TCP `80` and `443` only; restrict SSH `22` by source.
+- Do not publish application ports `8000`, `8080`, `5984`, or `1080`.
+- Keep API keys, bot tokens, feedback private keys, VLESS credentials, databases,
+  model files, archives, and generated samples out of Git.
+- Use one uvicorn worker; API admission is tied to llama.cpp `N_PARALLEL`.
+- Do not restore the public BusinessGPT Caddy route for convenience. Diagnose
+  through `docker exec` or the bot network instead.

@@ -1,276 +1,161 @@
-# BusinessGPT Telegram Bot Service
+# BusinessGPT Telegram Bot
 
-Private Telegram bot container for BusinessGPT chat integration.
+Private long-polling Telegram integration for BusinessGPT. It owns per-group
+prompt state, generation settings, image triggers, and encrypted reaction
+samples. It publishes no port and has no Caddy route.
 
-The bot uses Telegram long polling, so it does not expose a public HTTP port and
-does not need a Caddy route. It runs on the VM's private `edge` Docker network
-and calls `businessgpt-api` directly. When Telegram is unavailable from the VM,
-an optional Xray sidecar sends only Telegram traffic through VLESS:
-
-```text
-Telegram <-> [businessgpt-xray] <-> businessgpt-bot
-                                      |
-                                      +-> http://businessgpt-api:8000/generate
-```
-
-## Helper Scripts
-
-Use these from the repo root unless noted otherwise:
-
-```text
-scripts/build_businessgpt_bot_amd64.sh
-```
-
-Builds `businessgpt-bot:latest` for Linux amd64, saves it as
-`businessgpt-bot.tar.gz`.
-
-```text
-scripts/run_businessgpt_bot_vm.sh
-```
-
-Runs on the VM. It creates `/opt/businessgpt-bot/data`, ensures Docker network
-`edge` exists, replaces the old `businessgpt-bot` container, mounts SQLite data
-at `/data`, and publishes no ports.
-
-```text
-scripts/vless_link_to_xray_config.py
-```
-
-Reads a VLESS XHTTP/TLS share link from a hidden prompt and writes a private
-Xray client configuration with file mode `0600`. The link and credentials are
-not printed.
-
-```text
-scripts/build_businessgpt_xray_amd64.sh
-scripts/run_businessgpt_xray_vm.sh
-```
-
-Pulls and exports the official pinned Xray image locally, then runs it on the
-VM as a private SOCKS sidecar with no published ports.
-
-```text
-scripts/export_businessgpt_feedback_samples.py
-```
-
-Runs on your PC against a copied `bot.sqlite3` file and decrypts reaction
-feedback samples with the private key kept on your PC.
-
-## Prerequisites
-
-- `businessgpt-api` must already be deployed with the new `/generate`
-  `system_prompt` support.
-- `businessgpt-api` and `businessgpt-bot` must share Docker network `edge`.
-- You need a Telegram bot token from BotFather.
-- Configure at least one numeric Telegram user ID as a global recovery admin.
-  Telegram owners and administrators are authorized automatically inside each
-  group they manage.
-- In BotFather, disable privacy mode if the bot should see normal group
-  context.
-- In the target group, make the bot admin if you want reaction updates.
-
-## One-Time Key Setup
-
-The bot encrypts stored generation samples with a public key. The VM gets only
-the public key. The private key stays on your PC.
-
-After building the image, generate keys without installing Python dependencies
-on your Mac:
-
-```bash
-cd /Users/developer/Documents/businessgpt-server
-scripts/build_businessgpt_bot_amd64.sh
-docker run --rm businessgpt-bot:latest python -m bot.crypto
-```
-
-Output shape:
-
-```text
-BUSINESSGPT_BOT_FEEDBACK_PUBLIC_KEY_B64=...
-PRIVATE_KEY_B64_KEEP_ON_PC=...
-```
-
-Use `BUSINESSGPT_BOT_FEEDBACK_PUBLIC_KEY_B64` on the VM. Keep
-`PRIVATE_KEY_B64_KEEP_ON_PC` off the VM.
-
-## Deploy Or Update
-
-### Routine update
-
-After the first deployment, run one command on the Mac:
-
-```bash
-cd /Users/developer/Documents/businessgpt-server
-scripts/deploy_businessgpt_bot.sh
-```
-
-It builds Linux amd64 locally, uploads the image and VM helpers, recovers the
-running container's environment without printing secrets, creates a timestamped
-SQLite backup, starts the replacement, and waits for Telegram application
-startup. A failed startup automatically restores the prior container.
-
-The previous container and SQLite backup are retained after success. The script
-prints their names so they can be removed manually after verification.
-
-Connection defaults can be overridden without editing the script:
-
-```bash
-BUSINESSGPT_DEPLOY_TARGET=user@host \
-BUSINESSGPT_SSH_KEY=~/.ssh/server-key \
-scripts/deploy_businessgpt_bot.sh
-```
-
-### First deployment
-
-Run on your Mac:
-
-```bash
-cd /Users/developer/Documents/businessgpt-server
-scripts/build_businessgpt_bot_amd64.sh
-
-ssh -i ~/.ssh/businessgpt_ed25519 deploy@192.0.2.10 'mkdir -p /opt/businessgpt-bot'
-scp -i ~/.ssh/businessgpt_ed25519 businessgpt-bot.tar.gz scripts/run_businessgpt_bot_vm.sh \
-  deploy@192.0.2.10:/opt/businessgpt-bot/
-```
-
-Run on the VM:
-
-```bash
-cd /opt/businessgpt-bot
-gunzip -c businessgpt-bot.tar.gz | docker load
-chmod +x run_businessgpt_bot_vm.sh
-
-export BUSINESSGPT_BOT_TOKEN='<telegram-bot-token>'
-export BUSINESSGPT_BOT_ADMIN_USER_IDS='<your-telegram-user-id>'
-export BUSINESSGPT_API_KEY='<same-token-used-by-businessgpt-api>'
-export BUSINESSGPT_BOT_FEEDBACK_PUBLIC_KEY_B64='<public-key-from-your-pc>'
-
-./run_businessgpt_bot_vm.sh
-docker logs --tail=100 businessgpt-bot
-```
-
-Optional runtime defaults:
-
-```bash
-export BUSINESSGPT_BOT_TELEGRAM_PROXY_URL='socks5://businessgpt-xray:1080'
-export BUSINESSGPT_API_URL='http://businessgpt-api:8000/generate'
-export BUSINESSGPT_BOT_DB_PATH='/data/bot.sqlite3'
-export BUSINESSGPT_BOT_MAX_TOKENS=128
-export BUSINESSGPT_BOT_TEMPERATURE=0.9
-export BUSINESSGPT_BOT_TOP_P=0.9
-export BUSINESSGPT_BOT_TOP_K=50
-export BUSINESSGPT_BOT_REPETITION_PENALTY=1.2
-```
-
-For manual updates, `update_businessgpt_bot_vm.sh` performs the backup,
-readiness check, and rollback around `run_businessgpt_bot_vm.sh`.
-
-## VLESS XHTTP/TLS Egress
-
-Use this only when the VM cannot connect directly to `api.telegram.org`. The
-VLESS endpoint must be outside the blocked network. Do not put the VLESS share
-link in a command argument, shell history, Git, or chat.
-
-Build and export Xray on the Mac:
-
-```bash
-cd /Users/developer/Documents/businessgpt-server
-scripts/build_businessgpt_xray_amd64.sh
-```
-
-Copy the archive, converter, and runner to the VM:
-
-```bash
-ssh -i ~/.ssh/businessgpt_ed25519 deploy@192.0.2.10 \
-  'sudo install -d -o xofi -g xofi /opt/businessgpt-xray'
-
-scp -i ~/.ssh/businessgpt_ed25519 \
-  businessgpt-xray.tar.gz \
-  scripts/vless_link_to_xray_config.py \
-  scripts/run_businessgpt_xray_vm.sh \
-  deploy@192.0.2.10:/opt/businessgpt-xray/
-```
-
-On the VM, load the image and generate the private config. The converter asks
-for the share link without echoing it:
-
-```bash
-cd /opt/businessgpt-xray
-gunzip -c businessgpt-xray.tar.gz | docker load
-chmod +x vless_link_to_xray_config.py run_businessgpt_xray_vm.sh
-./vless_link_to_xray_config.py --output /opt/businessgpt-xray/config.json
-./run_businessgpt_xray_vm.sh
-```
-
-Verify Telegram through the private SOCKS endpoint without displaying the bot
-token:
-
-```bash
-docker run --rm --network edge curlimages/curl:8.15.0 \
-  --proxy socks5h://businessgpt-xray:1080 \
-  --connect-timeout 15 \
-  https://api.telegram.org
-```
-
-Then restart the bot with its Telegram proxy configured:
-
-```bash
-export BUSINESSGPT_BOT_TELEGRAM_PROXY_URL='socks5://businessgpt-xray:1080'
-./run_businessgpt_bot_vm.sh
-```
-
-The bot-to-API request remains direct on `edge`; only Telegram SDK requests use
-the proxy.
-
-## Runtime Shape
-
-Container:
+## Runtime Topology
 
 ```text
 businessgpt-bot
+  |-- businessgpt-backend (internal) -> businessgpt-api:8000
+  `-- businessgpt-proxy   (internal) -> businessgpt-xray:1080
+
+businessgpt-xray -> businessgpt-egress -> VLESS -> api.telegram.org
 ```
 
-Docker network:
+Only the bot can reach both the inference API and SOCKS proxy. The API cannot
+reach the internet; Xray cannot reach the API; unrelated `edge` containers can
+reach neither.
+
+Persistent host data is `/opt/businessgpt-bot/data`, mounted at `/data`.
+SQLite defaults to `/data/bot.sqlite3`.
+
+## Helper Scripts
+
+Run local scripts from repository root.
+
+| Script | Where | Purpose |
+| --- | --- | --- |
+| `build_businessgpt_bot_amd64.sh` | Mac | Build and save `businessgpt-bot.tar.gz` |
+| `deploy_businessgpt_bot.sh` | Mac | Routine build, upload, backup, update, readiness, rollback |
+| `deploy_businessgpt_hardening.sh` | Mac | One-time migration of the existing full stack |
+| `run_businessgpt_bot_vm.sh` | VM | Recreate the hardened bot container from `bot.env` |
+| `update_businessgpt_bot_vm.sh` | VM | Transactional bot-only image update |
+| `vless_link_to_xray_config.py` | VM | Hidden-input VLESS link conversion to mode-`0600` JSON |
+| `build_businessgpt_xray_amd64.sh` | Mac | Build/save the pinned Xray image |
+| `run_businessgpt_xray_vm.sh` | VM | Recreate isolated Xray networks/container |
+| `export_businessgpt_feedback_samples.py` | Mac | Decrypt copied feedback DB and optional media |
+
+Docker builds use only `services/businessgpt-bot` as context. The root and
+service `.dockerignore` files prevent local secrets, artifacts, and databases
+from entering the build context.
+
+## Required Telegram Setup
+
+1. Create the bot with BotFather.
+2. Disable group privacy if the bot should retain ordinary recent messages as
+   context.
+3. Add the bot only to intended groups; application code still enforces the
+   explicit group allowlist.
+4. Make it a group administrator so Telegram delivers reaction updates.
+
+At startup, the bot registers command suggestions. Ordinary group members see
+`/gpt`; group administrators see the settings commands.
+
+## Authorization Model
+
+`BUSINESSGPT_BOT_ALLOWED_CHAT_IDS` is mandatory and contains negative Telegram
+group/supergroup IDs. Updates from every other group are stopped before message
+caching, command processing, generation, or reaction storage.
+
+Roles:
+
+- Any member of an allowed group can trigger generation.
+- A live Telegram owner/admin can manage that allowed group's prompt presets,
+  active model choice, context depth, and sampling settings.
+- `BUSINESSGPT_BOT_OWNER_USER_IDS` can recover settings and is the only role
+  allowed to create, edit, or delete global model endpoint profiles.
+- Private settings links are bound to the encoded target group. Every callback
+  repeats the allowlist and live group-admin check, so an old button cannot
+  modify a newly selected group.
+
+Endpoint URLs are normalized and must exactly match
+`BUSINESSGPT_BOT_ALLOWED_API_URLS`. Credentials, query strings, fragments, and
+paths other than `/generate` are rejected. The production bearer key is never
+sent before this check and redirects are disabled.
+
+## Configuration
+
+Production file: `/opt/businessgpt-bot/bot.env`, mode `0600` or `0400`.
+
+Required:
 
 ```text
-edge
+BUSINESSGPT_BOT_TOKEN=
+BUSINESSGPT_BOT_OWNER_USER_IDS=
+BUSINESSGPT_BOT_ALLOWED_CHAT_IDS=
+BUSINESSGPT_API_KEY=
+BUSINESSGPT_BOT_FEEDBACK_PUBLIC_KEY_B64=<PC public key>
 ```
 
-Persistent VM mount:
+Production routing:
 
 ```text
-/opt/businessgpt-bot/data:/data
+BUSINESSGPT_BOT_TELEGRAM_PROXY_URL=socks5://businessgpt-xray:1080
+BUSINESSGPT_API_URL=http://businessgpt-api:8000/generate
+BUSINESSGPT_BOT_ALLOWED_API_URLS=http://businessgpt-api:8000/generate
+BUSINESSGPT_BOT_DB_PATH=/data/bot.sqlite3
+BUSINESSGPT_BOT_MEDIA_CACHE_DIR=/data/pending-media
 ```
 
-SQLite path inside container:
+Operational defaults are listed in the root `.env.example`. Database and media
+paths must be absolute paths below `/data`; values elsewhere would be lost when
+the container is replaced and are rejected at startup.
 
-```text
-/data/bot.sqlite3
+Do not put literal tokens in `export` commands. The one-time migration helper
+recovers values from the existing containers, writes private env files, and
+rotates the API key without printing it.
+
+## Feedback Encryption Key
+
+Generate the sealed-box key pair locally from the final bot image:
+
+```bash
+docker run --rm businessgpt-bot:latest python -m bot.crypto
 ```
 
-There is no `-p` port publish and no Caddy route.
+Store `BUSINESSGPT_BOT_FEEDBACK_PUBLIC_KEY_B64` on the VM. Keep
+`PRIVATE_KEY_B64_KEEP_ON_PC` only on the PC and in a separate backup. The VM
+cannot decrypt stored payloads or images.
 
-Optional private proxy container:
+## Deploy And Update
 
-```text
-businessgpt-xray
+One-time migration of the currently running stack:
+
+```bash
+scripts/deploy_businessgpt_hardening.sh
 ```
+
+Routine bot-only update:
+
+```bash
+scripts/deploy_businessgpt_bot.sh
+```
+
+The routine updater obtains the configured DB path from the container, creates
+a consistent SQLite backup under `/data/backups`, starts the replacement, and
+waits for Telegram's `Application started` log. Failure renames and restarts the
+previous container. Success keeps two old bot containers and seven update
+backups. Docker logs rotate at 10 MiB with three files.
 
 ## Telegram Usage
 
-Generation:
+Generation triggers:
 
 ```text
 /gpt <message>
+reply to a bot answer
+mention the bot
 ```
 
-The bot also answers when someone replies to a bot message or mentions the bot.
-An image is sent to the model when a JPEG, PNG, or WebP is attached to `/gpt`
-or a mention, when an image is sent as a reply to the bot, or when text replies
-directly to an image. Standalone unaddressed images remain silent. The bot
-accepts one image up to 10 MB.
+An attached JPEG, PNG, or WebP is included when `/gpt`, a mention, or a reply
+triggers the message. Replying with text to an image also sends the replied-to
+image. Standalone unaddressed images remain silent. Input is limited to one
+image and 10 MB.
 
-Generated replies have ASCII `@` characters removed before they are sent, so
-model output cannot trigger Telegram username notifications.
+Generated output is split below Telegram's message limit. ASCII `@` is removed
+before sending so model output cannot notify usernames.
 
 First checks:
 
@@ -280,133 +165,145 @@ First checks:
 /gpt test
 ```
 
-`/settings` is the primary admin UI. Telegram group owners/admins can use it
-for their own group; `BUSINESSGPT_BOT_ADMIN_USER_IDS` remains a global
-break-glass override. The private editor link checks live group membership
-before opening and on subsequent actions. The menu selects prompt and model profiles and
-sets per-chat recent context depth, max tokens, temperature, top P, top K, and
-repeat penalty. Group settings include an **Edit in private chat** button; its
-BotFather deep link binds private prompt/model commands to that group for 24
-hours. Recent context defaults to zero and, when enabled, stores at most 20
-messages in RAM only. A bot restart clears it.
+The `/settings` menu shows the active prompt and model names. Press the prompt
+button to preview actual prompt text; API-default text is fetched from the
+authenticated API. Group settings offer an encoded private-editor link for
+prompt creation/editing. Context choices are `0`, `5`, `10`, and `20`, with 10
+as the default.
 
-Pressing the active prompt button opens its text preview. Saved presets are
-read from SQLite; `API default` is fetched from the authenticated model API so
-the preview reflects the prompt currently used by that endpoint.
-
-The bot registers Telegram command suggestions at startup. Group members see
-`/gpt`; Telegram group administrators see the management commands as well.
-Button callbacks are included explicitly in the long-polling update list.
-
-Prompt presets, group-admin or global-admin only:
+Prompt presets are scoped per group:
 
 ```text
 /prompts
-/prompt_show <name>
+/prompt_show [name]
 /prompt_use <name>
-/prompt_new <name>
-/prompt_edit <name>
+/prompt_new <name> [text]
+/prompt_edit <name> [text]
 /prompt_delete <name>
 /prompt_reset
 /prompt_test <name> <message>
 ```
 
-For long prompt text:
+For a long prompt:
 
 ```text
 /prompt_new drunk_short
-<send next message as prompt text>
+<the next message becomes the prompt text>
 ```
 
-Model profiles, group-admin or global-admin only:
+The pending action expires after 15 minutes. `/cancel` clears it immediately.
+Validation failures leave the editor active instead of consuming the next
+message.
+
+Model selection is available to group admins; endpoint mutation is owner-only:
 
 ```text
 /models
-/model_show <name>
+/model_show [name]
 /model_use <name>
-/model_new <name> <api_url> [max_tokens] [temperature] [top_p] [top_k] [repetition_penalty]
-/model_edit <name> <api_url> [max_tokens] [temperature] [top_p] [top_k] [repetition_penalty]
+/model_new <name> <api_url> [max] [temp] [top_p] [top_k] [repeat]
+/model_edit <name> <api_url> [max] [temp] [top_p] [top_k] [repeat]
 /model_delete <name>
 ```
 
-The default model profile is created only when missing. After that, model
-profile edits made from Telegram persist across restarts.
+All persisted sampling values are finite and centrally range-checked. Invalid
+or stale endpoint profiles are quarantined at startup.
 
-Other admin commands:
+## Context And Admission
 
-```text
-/tools
-```
+The live context cache stores at most 20 messages per chat in RAM. It has a
+64-chat LRU bound and six-hour idle TTL by default. A restart clears it. The
+selected context included in a generated answer is copied into that answer's
+encrypted feedback payload, so reaction-selected training samples remain
+self-contained after the RAM cache expires.
 
-## Reaction Feedback
+The bot handles ordinary Telegram updates concurrently while a generation is
+running. Generation itself defaults to one active job, three requests per user
+per minute, and ten requests per chat per minute. Busy work is rejected quickly
+instead of blocking settings and reaction handling behind a long model call.
 
-When a user adds a reaction to a bot answer, the bot records the reaction event
-and links it to the encrypted generation sample for that answer. Removing a
-reaction does not select a previously unselected sample.
+## Reaction Data And Retention
 
-Text generation samples are sealed-box encrypted immediately. Image bytes are
-also encrypted immediately, then kept as pending ciphertext for at most 24
-hours under `/data/pending-media` with a 256 MB cap. Only a non-empty reaction
-promotes the encrypted image into SQLite; expired or evicted pending images are
-deleted. The VM has only the public key and cannot decrypt either form.
+Before any reaction, each answer stores sealed schema-v2 ciphertext containing:
 
-Only bot outbound messages are eligible for reaction feedback. Reactions to
-other group messages are ignored.
+- exact system prompt text, name, and hash;
+- complete request messages and retained chat context;
+- model profile, generation settings, and API URL;
+- model/projector hashes, llama.cpp revision, and context-fit metadata;
+- complete API response and final Telegram answer.
 
-To inspect reacted samples, copy the SQLite DB to your PC and decrypt locally:
+Image content is represented by a hash in the JSON payload. The encrypted image
+bytes are held separately and promoted only if the answer receives a non-empty
+reaction.
+
+Every add/change/remove reaction transition is retained. A non-empty reaction
+marks the sample for long-term retention; removing it later does not erase the
+training event. This creates a labeled feedback corpus. Telegram reactions are
+scalar or categorical feedback, not automatically pairwise RLHF preferences;
+the exporter preserves enough provenance to build later reward-model, SFT, or
+preference datasets intentionally.
+
+Default limits:
+
+| Data | Retention |
+| --- | --- |
+| Unreacted encrypted samples | 7 days, 5,000 rows, 512 MiB |
+| Reacted encrypted samples | 50,000 rows, 4 GiB |
+| Pending encrypted image files | 24 hours, 256 MiB |
+| Reacted encrypted image media | 2 GiB |
+
+Hourly maintenance removes expired/orphaned data, enforces caps, checkpoints
+the WAL, and warns when free disk space falls below 5 GiB.
+
+## Local Export
+
+Create a consistent DB copy on the VM without stopping the bot:
 
 ```bash
-cd /Users/developer/Documents/businessgpt-server
 ssh -i ~/.ssh/businessgpt_ed25519 deploy@192.0.2.10 \
-  'docker exec businessgpt-bot python -c "import sqlite3; s=sqlite3.connect(\"/data/bot.sqlite3\"); d=sqlite3.connect(\"/data/bot-backup.sqlite3\"); s.backup(d); d.close(); s.close()"'
-scp -i ~/.ssh/businessgpt_ed25519 \
-  deploy@192.0.2.10:/opt/businessgpt-bot/data/bot-backup.sqlite3 \
-  ./bot.sqlite3
+  'docker exec businessgpt-bot python -c '\''import sqlite3; s=sqlite3.connect("/data/bot.sqlite3"); d=sqlite3.connect("/data/feedback-export.sqlite3"); s.backup(d); d.close(); s.close()'\'''
 
-export BUSINESSGPT_BOT_FEEDBACK_PRIVATE_KEY_B64='<private-key-kept-on-pc>'
-scripts/export_businessgpt_feedback_samples.py ./bot.sqlite3 -o feedback.jsonl
+scp -i ~/.ssh/businessgpt_ed25519 \
+  deploy@192.0.2.10:/opt/businessgpt-bot/data/feedback-export.sqlite3 \
+  ./bot.sqlite3
 ```
 
-Export retained reacted images on the PC:
+Read the private key without putting it in shell history, then export reacted
+records:
 
 ```bash
+read -r -s BUSINESSGPT_BOT_FEEDBACK_PRIVATE_KEY_B64
+export BUSINESSGPT_BOT_FEEDBACK_PRIVATE_KEY_B64
+printf '\n'
 scripts/export_businessgpt_feedback_samples.py ./bot.sqlite3 \
   --media-output-dir ./feedback-media \
   -o feedback.jsonl
+unset BUSINESSGPT_BOT_FEEDBACK_PRIVATE_KEY_B64
 ```
 
-To include samples that do not have reactions yet:
-
-```bash
-scripts/export_businessgpt_feedback_samples.py ./bot.sqlite3 \
-  --include-pending \
-  -o feedback-all.jsonl
-```
+Add `--include-pending` only when intentionally inspecting the unreacted
+seven-day buffer. Exported JSONL schema v2 contains full reaction history and
+the final reaction state. The exporter remains compatible with schema-v1 rows.
 
 ## Troubleshooting
 
-Check container status:
-
 ```bash
-docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+docker ps --filter name=businessgpt \
+  --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 docker logs --tail=100 businessgpt-bot
+docker inspect businessgpt-bot \
+  --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'
 ```
 
-Check Docker network membership:
+Expected bot networks: `businessgpt-backend businessgpt-proxy`.
+
+Verify private DNS from the running bot:
 
 ```bash
-docker inspect businessgpt-bot --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'
-docker inspect businessgpt-api --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'
+docker exec businessgpt-bot python -c \
+  'import socket; print(socket.gethostbyname("businessgpt-api")); print(socket.gethostbyname("businessgpt-xray"))'
 ```
 
-Check API reachability from the bot container:
-
-```bash
-docker exec businessgpt-bot python - <<'PY'
-import httpx
-print(httpx.get('http://businessgpt-api:8000/health', timeout=10).text)
-PY
-```
-
-If reaction feedback does not appear, confirm the bot is an admin in the group
-and that BotFather privacy mode is disabled.
+If reactions are absent, confirm the bot is a Telegram group admin and that
+reaction updates are enabled for the bot. If ordinary context is absent,
+confirm BotFather privacy mode is disabled.

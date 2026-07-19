@@ -2,8 +2,9 @@ import unittest
 from types import SimpleNamespace
 
 from telegram.constants import ChatType
+from telegram.ext import ApplicationHandlerStop
 
-from bot.handlers import _is_authorized_admin, _member_status_is_admin
+from bot.handlers import authorize_update, _is_authorized_admin, _member_status_is_admin
 
 
 class FakeBot:
@@ -27,7 +28,11 @@ class FakeDB:
 def make_context(*, status, global_admin_ids=(), session_chat_id=None):
     bot = FakeBot(status)
     bot_data = {
-        "config": SimpleNamespace(admin_user_ids=frozenset(global_admin_ids)),
+        "config": SimpleNamespace(
+            admin_user_ids=frozenset(global_admin_ids),
+            owner_user_ids=frozenset(global_admin_ids),
+            allowed_chat_ids=frozenset({-200, -300}),
+        ),
         "db": FakeDB(session_chat_id),
         "businessgpt": object(),
         "feedback_encryptor": object(),
@@ -58,6 +63,27 @@ class AuthorizationTests(unittest.TestCase):
 
 
 class AuthorizationDecisionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_allowed_chat_gate_stops_untrusted_group_before_handlers(self):
+        context = make_context(status="member")
+        update = make_update(chat_id=-999)
+        update.effective_chat = SimpleNamespace(
+            id=-999,
+            type=ChatType.SUPERGROUP,
+        )
+
+        with self.assertRaises(ApplicationHandlerStop):
+            await authorize_update(update, context)
+
+    async def test_allowed_chat_gate_accepts_configured_group(self):
+        context = make_context(status="member")
+        update = make_update(chat_id=-200)
+        update.effective_chat = SimpleNamespace(
+            id=-200,
+            type=ChatType.SUPERGROUP,
+        )
+
+        await authorize_update(update, context)
+
     async def test_group_admin_is_authorized_for_current_group(self):
         context = make_context(status="administrator")
 

@@ -4,23 +4,32 @@ import atexit
 import hashlib
 import os
 import re
+import secrets
 import socket
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
-from typing import Literal, Optional, Union
+from typing import Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
 
+from api_security import SecurityLimitsMiddleware
 from context_window import ContextBudgetError, PromptMessage, fit_messages_to_context
 from media import ImageValidationError, NormalizedImage, normalize_image_data_url
+from model_verification import verify_model_files
+from request_models import (
+    ChatMessage,
+    GenerateRequest,
+    GenerateResponse,
+    TextContentPart,
+)
 
 
 MODEL_PATH = os.environ.get("BUSINESSGPT_MODEL_PATH", "/models/businessgpt.gguf")
 MMPROJ_PATH = os.environ.get("BUSINESSGPT_MMPROJ_PATH", "").strip() or None
-API_KEY = os.environ.get("BUSINESSGPT_API_KEY")
+API_KEY = os.environ.get("BUSINESSGPT_API_KEY", "").strip()
 N_CTX = int(os.environ.get("BUSINESSGPT_N_CTX", "4096"))
 CONTEXT_SAFETY_TOKENS = int(os.environ.get("BUSINESSGPT_CONTEXT_SAFETY_TOKENS", "16"))
 IMAGE_MAX_TOKENS = int(os.environ.get("BUSINESSGPT_IMAGE_MAX_TOKENS", "1024"))
@@ -28,13 +37,44 @@ N_THREADS = int(os.environ.get("BUSINESSGPT_N_THREADS", str(os.cpu_count() or 4)
 N_GPU_LAYERS = int(os.environ.get("BUSINESSGPT_N_GPU_LAYERS", "0"))
 N_PARALLEL = int(os.environ.get("BUSINESSGPT_N_PARALLEL", "1"))
 STARTUP_TIMEOUT_SECONDS = int(os.environ.get("BUSINESSGPT_STARTUP_TIMEOUT_SECONDS", "900"))
+TOKENIZE_TIMEOUT_SECONDS = float(
+    os.environ.get("BUSINESSGPT_TOKENIZE_TIMEOUT_SECONDS", "30")
+)
+GENERATION_TIMEOUT_SECONDS = float(
+    os.environ.get("BUSINESSGPT_GENERATION_TIMEOUT_SECONDS", "300")
+)
+HEALTH_TIMEOUT_SECONDS = float(os.environ.get("BUSINESSGPT_HEALTH_TIMEOUT_SECONDS", "2"))
+MAX_REQUEST_BODY_BYTES = int(
+    os.environ.get("BUSINESSGPT_MAX_REQUEST_BODY_BYTES", str(16 * 1024 * 1024))
+)
+IMAGE_DECODE_CONCURRENCY = int(
+    os.environ.get("BUSINESSGPT_IMAGE_DECODE_CONCURRENCY", "1")
+)
 LLAMA_SERVER_BIN = os.environ.get("LLAMA_SERVER_BIN", "/opt/llama.cpp/build/bin/llama-server")
 LLAMA_HOST = os.environ.get("LLAMA_HOST", "127.0.0.1")
 LLAMA_PORT = int(os.environ.get("LLAMA_PORT", "8081"))
 LLAMA_URL = f"http://{LLAMA_HOST}:{LLAMA_PORT}"
-MAX_MESSAGE_CHARACTERS = 65_536
-MAX_IMAGE_DATA_URL_CHARACTERS = 14_500_000
-MAX_MESSAGES = 64
+LLAMA_CPP_REF = os.environ.get(
+    "LLAMA_CPP_REF", "a4107133a634250c8c9d888bc0bc8520dcfd6105"
+)
+MODEL_MANIFEST_PATH = os.environ.get(
+    "BUSINESSGPT_MODEL_MANIFEST_PATH", "/app/model-manifest.json"
+)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    if raw.lower() in {"1", "true", "yes", "on"}:
+        return True
+    if raw.lower() in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be true or false")
+
+
+ALLOW_INSECURE_NO_AUTH = _env_flag("BUSINESSGPT_ALLOW_INSECURE_NO_AUTH")
+ALLOW_UNVERIFIED_MODEL = _env_flag("BUSINESSGPT_ALLOW_UNVERIFIED_MODEL")
 
 if N_CTX <= 0:
     raise RuntimeError("BUSINESSGPT_N_CTX must be positive")
@@ -46,57 +86,22 @@ if N_PARALLEL <= 0:
     raise RuntimeError("BUSINESSGPT_N_PARALLEL must be positive")
 if STARTUP_TIMEOUT_SECONDS <= 0:
     raise RuntimeError("BUSINESSGPT_STARTUP_TIMEOUT_SECONDS must be positive")
+if min(TOKENIZE_TIMEOUT_SECONDS, GENERATION_TIMEOUT_SECONDS, HEALTH_TIMEOUT_SECONDS) <= 0:
+    raise RuntimeError("backend timeouts must be positive")
+if MAX_REQUEST_BODY_BYTES <= 0:
+    raise RuntimeError("BUSINESSGPT_MAX_REQUEST_BODY_BYTES must be positive")
+if IMAGE_DECODE_CONCURRENCY <= 0:
+    raise RuntimeError("BUSINESSGPT_IMAGE_DECODE_CONCURRENCY must be positive")
+if not API_KEY:
+    bind_host = os.environ.get("HOST", "0.0.0.0")
+    if not ALLOW_INSECURE_NO_AUTH or bind_host not in {"127.0.0.1", "localhost", "::1"}:
+        raise RuntimeError(
+            "BUSINESSGPT_API_KEY is required; insecure mode requires "
+            "BUSINESSGPT_ALLOW_INSECURE_NO_AUTH=true and loopback HOST"
+        )
 
 DEFAULT_SYSTEM_PROMPT = "Configure the system prompt at deployment time."
 SYSTEM_PROMPT = os.environ.get("BUSINESSGPT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
-
-
-class TextContentPart(BaseModel):
-    type: Literal["text"]
-    text: str = Field(..., min_length=1, max_length=MAX_MESSAGE_CHARACTERS)
-
-
-class ImageURLValue(BaseModel):
-    url: str = Field(..., min_length=1, max_length=MAX_IMAGE_DATA_URL_CHARACTERS)
-
-
-class ImageURLContentPart(BaseModel):
-    type: Literal["image_url"]
-    image_url: ImageURLValue
-
-
-ContentPart = Union[TextContentPart, ImageURLContentPart]
-
-
-class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: Union[
-        str,
-        list[ContentPart],
-    ]
-    name: Optional[str] = Field(None, max_length=128)
-
-
-class GenerateRequest(BaseModel):
-    prompt: Optional[str] = Field(None, min_length=1, max_length=MAX_MESSAGE_CHARACTERS)
-    messages: Optional[list[ChatMessage]] = Field(None, max_length=MAX_MESSAGES)
-    system_prompt: Optional[str] = Field(
-        None,
-        min_length=1,
-        max_length=MAX_MESSAGE_CHARACTERS,
-    )
-    max_tokens: int = Field(256, ge=1, le=1024)
-    temperature: float = Field(0.7, ge=0.0, le=2.0)
-    top_p: float = Field(0.9, ge=0.0, le=1.0)
-    top_k: int = Field(50, ge=0, le=200)
-    repetition_penalty: float = Field(1.1, ge=0.0, le=3.0)
-
-
-class GenerateResponse(BaseModel):
-    response: str
-    model: str
-    elapsed_ms: int
-    usage: dict
 
 
 @dataclass(frozen=True)
@@ -110,10 +115,10 @@ class PreparedMessage:
 
 
 def _require_auth(authorization: Optional[str] = Header(default=None)) -> None:
-    if not API_KEY:
+    if not API_KEY and ALLOW_INSECURE_NO_AUTH:
         return
     expected = f"Bearer {API_KEY}"
-    if authorization != expected:
+    if authorization is None or not secrets.compare_digest(authorization, expected):
         raise HTTPException(status_code=401, detail="invalid api key")
 
 
@@ -157,7 +162,12 @@ def _prepare_request_messages(req: GenerateRequest) -> list[PreparedMessage]:
                 if image_count > 1:
                     raise HTTPException(status_code=422, detail="at most one image is supported")
                 try:
-                    image = normalize_image_data_url(part.image_url.url)
+                    if not image_decode_slots.acquire(blocking=False):
+                        raise HTTPException(status_code=503, detail="image decoder is busy")
+                    try:
+                        image = normalize_image_data_url(part.image_url.url)
+                    finally:
+                        image_decode_slots.release()
                 except ImageValidationError as exc:
                     raise HTTPException(status_code=422, detail=str(exc)) from exc
             text = "\n".join(part for part in text_parts if part).strip()
@@ -185,6 +195,7 @@ def _count_tokens(text: str) -> int:
     response = client.post(
         "/tokenize",
         json={"content": text, "add_special": True, "parse_special": True},
+        timeout=TOKENIZE_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     return len(response.json()["tokens"])
@@ -289,16 +300,24 @@ def _start_llama_server() -> subprocess.Popen:
     return subprocess.Popen(cmd)
 
 
+verified_model_sha256, verified_projector_sha256 = verify_model_files(
+    manifest_path=MODEL_MANIFEST_PATH,
+    model_path=MODEL_PATH,
+    projector_path=MMPROJ_PATH,
+    allow_unverified=ALLOW_UNVERIFIED_MODEL,
+)
+image_decode_slots = threading.BoundedSemaphore(IMAGE_DECODE_CONCURRENCY)
+
 llama_proc = _start_llama_server()
 atexit.register(lambda: llama_proc.terminate() if llama_proc.poll() is None else None)
 _wait_for_port(LLAMA_HOST, LLAMA_PORT)
 
-client = httpx.Client(base_url=LLAMA_URL, timeout=httpx.Timeout(360.0))
+client = httpx.Client(base_url=LLAMA_URL, timeout=httpx.Timeout(GENERATION_TIMEOUT_SECONDS))
 
 
 def _backend_props() -> dict:
     try:
-        response = client.get("/props")
+        response = client.get("/props", timeout=HEALTH_TIMEOUT_SECONDS)
         response.raise_for_status()
         return response.json()
     except (httpx.HTTPError, ValueError):
@@ -324,25 +343,38 @@ if MMPROJ_PATH and not startup_props.get("modalities", {}).get("vision", False):
     llama_proc.terminate()
     raise RuntimeError("llama-server loaded the projector but did not report vision capability")
 
-app = FastAPI(title="BusinessGPT API", version="0.5.0")
+app = FastAPI(
+    title="BusinessGPT API",
+    version="0.6.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+app.add_middleware(
+    SecurityLimitsMiddleware,
+    api_key=API_KEY,
+    max_body_bytes=MAX_REQUEST_BODY_BYTES,
+    max_generations=N_PARALLEL,
+)
 
 
 @app.get("/health")
 def health() -> dict:
+    return {"ok": llama_proc.poll() is None}
+
+
+@app.get("/health/ready", dependencies=[Depends(_require_auth)])
+def readiness() -> dict:
     props = _backend_props()
     modalities = props.get("modalities", {})
+    ready = llama_proc.poll() is None and bool(props)
+    if not ready:
+        raise HTTPException(status_code=503, detail="backend is not ready")
     return {
-        "ok": llama_proc.poll() is None,
-        "model": os.path.basename(MODEL_PATH),
-        "projector": os.path.basename(MMPROJ_PATH) if MMPROJ_PATH else None,
-        "backend": "native-llama-server",
-        "backend_build": props.get("build_info"),
-        "backend_url": LLAMA_URL,
-        "modalities": modalities,
+        "ok": True,
         "vision_enabled": bool(modalities.get("vision", False)),
-        "context_limit_tokens": N_CTX,
-        "context_safety_tokens": CONTEXT_SAFETY_TOKENS,
-        "image_max_tokens": IMAGE_MAX_TOKENS,
+        "model_sha256": verified_model_sha256,
+        "projector_sha256": verified_projector_sha256,
     }
 
 
@@ -407,7 +439,11 @@ def generate(req: GenerateRequest) -> GenerateResponse:
         "reasoning_format": "none",
     }
     try:
-        result = client.post("/v1/chat/completions", json=payload)
+        result = client.post(
+            "/v1/chat/completions",
+            json=payload,
+            timeout=GENERATION_TIMEOUT_SECONDS,
+        )
         result.raise_for_status()
         data = result.json()
         response_text = data["choices"][0]["message"]["content"]
@@ -426,6 +462,13 @@ def generate(req: GenerateRequest) -> GenerateResponse:
             "completion_tokens": backend_usage.get("completion_tokens"),
             "total_tokens": backend_usage.get("total_tokens"),
             "prompt_hash": _prompt_hash(system_prompt),
+            "model_sha256": verified_model_sha256,
+            "projector_sha256": verified_projector_sha256,
+            "llama_cpp_revision": LLAMA_CPP_REF,
+            "context_fit_version": 1,
+            "retained_source_indices": [
+                message.source_index for message in context_fit.messages
+            ],
             "prepared_prompt_tokens": context_fit.prompt_tokens,
             "context_limit_tokens": N_CTX,
             "prompt_budget_tokens": prompt_budget_tokens,

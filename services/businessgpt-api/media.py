@@ -18,6 +18,14 @@ DATA_URL_RE = re.compile(
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_EDGE = 1280
 MAX_IMAGE_PIXELS = 40_000_000
+IMAGE_FORMAT_TO_MIME_TYPE = {
+    "JPEG": "image/jpeg",
+    "PNG": "image/png",
+    "WEBP": "image/webp",
+}
+
+# Pillow's global is process-wide. Set it once rather than mutating it per request.
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
 
 class ImageValidationError(ValueError):
@@ -56,10 +64,17 @@ def normalize_image_data_url(value: str) -> NormalizedImage:
     if len(source) > MAX_IMAGE_BYTES:
         raise ImageValidationError("image exceeds the 10 MB limit")
 
-    previous_max_pixels = Image.MAX_IMAGE_PIXELS
-    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
     try:
         with Image.open(io.BytesIO(source)) as opened:
+            detected_mime_type = IMAGE_FORMAT_TO_MIME_TYPE.get(str(opened.format).upper())
+            if detected_mime_type is None:
+                raise ImageValidationError("unsupported detected image format")
+            if detected_mime_type != mime_type:
+                raise ImageValidationError("declared image MIME type does not match image data")
+            if opened.width <= 0 or opened.height <= 0:
+                raise ImageValidationError("image has invalid dimensions")
+            if opened.width * opened.height > MAX_IMAGE_PIXELS:
+                raise ImageValidationError("image dimensions are too large")
             opened.load()
             image = ImageOps.exif_transpose(opened)
             if image.width <= 0 or image.height <= 0:
@@ -80,11 +95,10 @@ def normalize_image_data_url(value: str) -> NormalizedImage:
             width, height = image.size
     except Image.DecompressionBombError as exc:
         raise ImageValidationError("image dimensions are too large") from exc
+    except ImageValidationError:
+        raise
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise ImageValidationError("image data could not be decoded") from exc
-    finally:
-        Image.MAX_IMAGE_PIXELS = previous_max_pixels
-
     encoded = base64.b64encode(normalized).decode("ascii")
     return NormalizedImage(
         data_url=f"data:image/jpeg;base64,{encoded}",

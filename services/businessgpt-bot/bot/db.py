@@ -9,6 +9,8 @@ import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable, Optional
 
+from .validation import normalize_api_url, validate_generation_settings, validate_generation_value
+
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
@@ -25,8 +27,13 @@ def validate_name(name: str) -> str:
 
 
 class BotDB:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, *, default_recent_context_messages: int = 10) -> None:
         self.path = path
+        self.default_recent_context_messages = int(
+            validate_generation_value(
+                "recent_context_messages", default_recent_context_messages
+            )
+        )
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -53,6 +60,23 @@ class BotDB:
                     created_at text not null,
                     updated_at text not null,
                     deleted_at text
+                );
+
+                create table if not exists prompt_presets_v2 (
+                    id integer primary key,
+                    chat_id integer not null,
+                    name text not null,
+                    text text not null,
+                    created_by integer,
+                    created_at text not null,
+                    updated_at text not null,
+                    deleted_at text,
+                    unique(chat_id, name)
+                );
+
+                create table if not exists schema_metadata (
+                    key text primary key,
+                    value text not null
                 );
 
                 create table if not exists model_profiles (
@@ -158,6 +182,78 @@ class BotDB:
             self._ensure_column("chat_settings", "top_p", "real")
             self._ensure_column("chat_settings", "top_k", "integer")
             self._ensure_column("chat_settings", "repetition_penalty", "real")
+            self._ensure_column("chat_settings", "active_prompt_v2_id", "integer")
+            self._ensure_column("outbound_messages", "prompt_preset_v2_id", "integer")
+            self._ensure_column("pending_admin_actions", "target_chat_id", "integer")
+            self._ensure_column(
+                "encrypted_feedback_samples",
+                "schema_version",
+                "integer not null default 1",
+            )
+            self._ensure_column(
+                "encrypted_feedback_samples",
+                "encrypted_bytes",
+                "integer not null default 0",
+            )
+            self._conn.execute(
+                "update encrypted_feedback_samples set encrypted_bytes = length(encrypted_payload_b64) "
+                "where encrypted_bytes = 0"
+            )
+            context_migration = self._conn.execute(
+                "select value from schema_metadata where key = 'context_default_v2'"
+            ).fetchone()
+            if context_migration is None:
+                self._conn.execute(
+                    "update chat_settings set recent_context_messages = ? "
+                    "where recent_context_messages = 0",
+                    (self.default_recent_context_messages,),
+                )
+                self._conn.execute(
+                    "insert into schema_metadata(key, value) values ('context_default_v2', ?)",
+                    (str(self.default_recent_context_messages),),
+                )
+            self._conn.commit()
+
+    def migrate_legacy_prompts(self, default_chat_id: int) -> None:
+        """Copy v1 global prompts into chat-scoped storage without breaking old exports."""
+        with self._lock:
+            rows = self._conn.execute(
+                "select * from prompt_presets where deleted_at is null order by id"
+            ).fetchall()
+            for row in rows:
+                chat_rows = self._conn.execute(
+                    "select chat_id from chat_settings where active_prompt_id = ?",
+                    (row["id"],),
+                ).fetchall()
+                chat_ids = {int(item["chat_id"]) for item in chat_rows if int(item["chat_id"]) < 0}
+                if not chat_ids:
+                    chat_ids = {default_chat_id}
+                for chat_id in chat_ids:
+                    self._conn.execute(
+                        """
+                        insert or ignore into prompt_presets_v2(
+                            chat_id, name, text, created_by, created_at, updated_at, deleted_at
+                        ) values (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            chat_id,
+                            row["name"],
+                            row["text"],
+                            row["created_by"],
+                            row["created_at"],
+                            row["updated_at"],
+                            row["deleted_at"],
+                        ),
+                    )
+                    copied = self._conn.execute(
+                        "select id from prompt_presets_v2 where chat_id = ? and name = ?",
+                        (chat_id, row["name"]),
+                    ).fetchone()
+                    self._conn.execute(
+                        "update chat_settings set active_prompt_v2_id = ? "
+                        "where chat_id = ? and active_prompt_id = ?",
+                        (copied["id"], chat_id, row["id"]),
+                    )
             self._conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -198,26 +294,29 @@ class BotDB:
         with self._lock:
             return list(self._conn.execute(sql, tuple(params)).fetchall())
 
-    def list_prompts(self) -> list[sqlite3.Row]:
+    def list_prompts(self, chat_id: int) -> list[sqlite3.Row]:
         return self._fetchall(
-            "select * from prompt_presets where deleted_at is null order by name"
+            "select * from prompt_presets_v2 where chat_id = ? and deleted_at is null order by name",
+            (chat_id,),
         )
 
-    def get_prompt_by_name(self, name: str) -> Optional[sqlite3.Row]:
+    def get_prompt_by_name(self, chat_id: int, name: str) -> Optional[sqlite3.Row]:
         return self._fetchone(
-            "select * from prompt_presets where name = ? and deleted_at is null",
-            (validate_name(name),),
+            "select * from prompt_presets_v2 where chat_id = ? and name = ? and deleted_at is null",
+            (chat_id, validate_name(name)),
         )
 
-    def get_prompt_by_id(self, preset_id: int | None) -> Optional[sqlite3.Row]:
+    def get_prompt_by_id(self, chat_id: int, preset_id: int | None) -> Optional[sqlite3.Row]:
         if preset_id is None:
             return None
         return self._fetchone(
-            "select * from prompt_presets where id = ? and deleted_at is null",
-            (preset_id,),
+            "select * from prompt_presets_v2 where chat_id = ? and id = ? and deleted_at is null",
+            (chat_id, preset_id),
         )
 
-    def upsert_prompt(self, *, name: str, text: str, created_by: int | None) -> sqlite3.Row:
+    def upsert_prompt(
+        self, *, chat_id: int, name: str, text: str, created_by: int | None
+    ) -> sqlite3.Row:
         name = validate_name(name)
         text = text.strip()
         if not text:
@@ -225,37 +324,39 @@ class BotDB:
         now = utc_now()
         with self._lock:
             existing = self._conn.execute(
-                "select id from prompt_presets where name = ?",
-                (name,),
+                "select id from prompt_presets_v2 where chat_id = ? and name = ?",
+                (chat_id, name),
             ).fetchone()
             if existing:
                 self._conn.execute(
                     """
-                    update prompt_presets
+                    update prompt_presets_v2
                     set text = ?, updated_at = ?, deleted_at = null
-                    where name = ?
+                    where chat_id = ? and name = ?
                     """,
-                    (text, now, name),
+                    (text, now, chat_id, name),
                 )
             else:
                 self._conn.execute(
                     """
-                    insert into prompt_presets(name, text, created_by, created_at, updated_at)
-                    values (?, ?, ?, ?, ?)
+                    insert into prompt_presets_v2(
+                        chat_id, name, text, created_by, created_at, updated_at
+                    ) values (?, ?, ?, ?, ?, ?)
                     """,
-                    (name, text, created_by, now, now),
+                    (chat_id, name, text, created_by, now, now),
                 )
             self._conn.commit()
-        row = self.get_prompt_by_name(name)
+        row = self.get_prompt_by_name(chat_id, name)
         assert row is not None
         return row
 
-    def soft_delete_prompt(self, name: str) -> bool:
+    def soft_delete_prompt(self, chat_id: int, name: str) -> bool:
         now = utc_now()
         with self._lock:
             cur = self._conn.execute(
-                "update prompt_presets set deleted_at = ?, updated_at = ? where name = ? and deleted_at is null",
-                (now, now, validate_name(name)),
+                "update prompt_presets_v2 set deleted_at = ?, updated_at = ? "
+                "where chat_id = ? and name = ? and deleted_at is null",
+                (now, now, chat_id, validate_name(name)),
             )
             self._conn.commit()
             return cur.rowcount > 0
@@ -263,8 +364,8 @@ class BotDB:
     def get_chat_settings(self, chat_id: int) -> sqlite3.Row:
         with self._lock:
             self._conn.execute(
-                "insert or ignore into chat_settings(chat_id) values (?)",
-                (chat_id,),
+                "insert or ignore into chat_settings(chat_id, recent_context_messages) values (?, ?)",
+                (chat_id, self.default_recent_context_messages),
             )
             self._conn.commit()
         row = self._fetchone("select * from chat_settings where chat_id = ?", (chat_id,))
@@ -275,25 +376,16 @@ class BotDB:
         with self._lock:
             self._conn.execute(
                 """
-                insert into chat_settings(chat_id, active_prompt_id)
+                insert into chat_settings(chat_id, active_prompt_v2_id)
                 values (?, ?)
-                on conflict(chat_id) do update set active_prompt_id = excluded.active_prompt_id
+                on conflict(chat_id) do update set active_prompt_v2_id = excluded.active_prompt_v2_id
                 """,
                 (chat_id, prompt_id),
             )
             self._conn.commit()
 
     def set_chat_setting(self, chat_id: int, field: str, value: Any) -> None:
-        allowed = {
-            "recent_context_messages",
-            "max_tokens",
-            "temperature",
-            "top_p",
-            "top_k",
-            "repetition_penalty",
-        }
-        if field not in allowed:
-            raise ValueError(f"unsupported chat setting: {field}")
+        value = validate_generation_value(field, value)
         with self._lock:
             self._conn.execute(
                 f"insert into chat_settings(chat_id, {field}) values (?, ?) "
@@ -305,7 +397,7 @@ class BotDB:
     def get_effective_generation_settings(self, chat_id: int) -> dict[str, Any]:
         chat = self.get_chat_settings(chat_id)
         model = self.get_active_model_profile(chat_id)
-        return {
+        return validate_generation_settings(**{
             "recent_context_messages": int(chat["recent_context_messages"]),
             "max_tokens": int(chat["max_tokens"] if chat["max_tokens"] is not None else model["max_tokens"]),
             "temperature": float(chat["temperature"] if chat["temperature"] is not None else model["temperature"]),
@@ -316,11 +408,11 @@ class BotDB:
                 if chat["repetition_penalty"] is not None
                 else model["repetition_penalty"]
             ),
-        }
+        })
 
     def get_active_prompt(self, chat_id: int) -> Optional[sqlite3.Row]:
         settings = self.get_chat_settings(chat_id)
-        return self.get_prompt_by_id(settings["active_prompt_id"])
+        return self.get_prompt_by_id(chat_id, settings["active_prompt_v2_id"])
 
     def list_model_profiles(self) -> list[sqlite3.Row]:
         return self._fetchall(
@@ -354,6 +446,14 @@ class BotDB:
         repetition_penalty: float,
     ) -> sqlite3.Row:
         name = validate_name(name)
+        api_url = normalize_api_url(api_url)
+        values = validate_generation_settings(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+        )
         now = utc_now()
         with self._lock:
             existing = self._conn.execute(
@@ -371,11 +471,11 @@ class BotDB:
                     (
                         api_url,
                         model_label,
-                        max_tokens,
-                        temperature,
-                        top_p,
-                        top_k,
-                        repetition_penalty,
+                        values["max_tokens"],
+                        values["temperature"],
+                        values["top_p"],
+                        values["top_k"],
+                        values["repetition_penalty"],
                         now,
                         name,
                     ),
@@ -393,11 +493,11 @@ class BotDB:
                         name,
                         api_url,
                         model_label,
-                        max_tokens,
-                        temperature,
-                        top_p,
-                        top_k,
-                        repetition_penalty,
+                        values["max_tokens"],
+                        values["temperature"],
+                        values["top_p"],
+                        values["top_k"],
+                        values["repetition_penalty"],
                         now,
                         now,
                     ),
@@ -439,40 +539,63 @@ class BotDB:
             raise RuntimeError("default model profile is missing")
         return default
 
-    def set_pending_action(self, *, chat_id: int, user_id: int, action: str, target_name: str) -> None:
+    def set_pending_action(
+        self,
+        *,
+        chat_id: int,
+        user_id: int,
+        target_chat_id: int,
+        action: str,
+        target_name: str,
+    ) -> None:
         with self._lock:
             self._conn.execute(
                 """
-                insert into pending_admin_actions(chat_id, user_id, action, target_name, created_at)
-                values (?, ?, ?, ?, ?)
+                insert into pending_admin_actions(
+                    chat_id, user_id, target_chat_id, action, target_name, created_at
+                ) values (?, ?, ?, ?, ?, ?)
                 on conflict(chat_id, user_id) do update set
+                    target_chat_id = excluded.target_chat_id,
                     action = excluded.action,
                     target_name = excluded.target_name,
                     created_at = excluded.created_at
                 """,
-                (chat_id, user_id, action, validate_name(target_name), utc_now()),
+                (
+                    chat_id,
+                    user_id,
+                    target_chat_id,
+                    action,
+                    validate_name(target_name),
+                    utc_now(),
+                ),
             )
             self._conn.commit()
 
-    def pop_pending_action(self, *, chat_id: int, user_id: int) -> Optional[sqlite3.Row]:
+    def delete_pending_action(self, *, chat_id: int, user_id: int) -> bool:
         with self._lock:
-            row = self._conn.execute(
-                "select * from pending_admin_actions where chat_id = ? and user_id = ?",
+            cursor = self._conn.execute(
+                "delete from pending_admin_actions where chat_id = ? and user_id = ?",
                 (chat_id, user_id),
-            ).fetchone()
-            if row:
-                self._conn.execute(
-                    "delete from pending_admin_actions where chat_id = ? and user_id = ?",
-                    (chat_id, user_id),
-                )
-                self._conn.commit()
-            return row
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
 
-    def get_pending_action(self, *, chat_id: int, user_id: int) -> Optional[sqlite3.Row]:
-        return self._fetchone(
+    def get_pending_action(
+        self, *, chat_id: int, user_id: int, ttl_seconds: int = 900
+    ) -> Optional[sqlite3.Row]:
+        row = self._fetchone(
             "select * from pending_admin_actions where chat_id = ? and user_id = ?",
             (chat_id, user_id),
         )
+        if row is None:
+            return None
+        cutoff = (datetime.now(UTC) - timedelta(seconds=ttl_seconds)).replace(
+            microsecond=0
+        ).isoformat()
+        if row["created_at"] <= cutoff:
+            self.delete_pending_action(chat_id=chat_id, user_id=user_id)
+            return None
+        return row
 
     def set_admin_session(self, *, user_id: int, target_chat_id: int, ttl_hours: int = 24) -> None:
         expires_at = (datetime.now(UTC) + timedelta(hours=ttl_hours)).replace(microsecond=0).isoformat()
@@ -514,7 +637,7 @@ class BotDB:
             self._conn.execute(
                 """
                 insert or replace into outbound_messages(
-                    chat_id, telegram_message_id, prompt_preset_id, model_profile_id,
+                    chat_id, telegram_message_id, prompt_preset_v2_id, model_profile_id,
                     prompt_hash, created_at
                 )
                 values (?, ?, ?, ?, ?, ?)
@@ -551,6 +674,7 @@ class BotDB:
         telegram_message_id: int,
         payload: dict[str, Any],
         encrypted_payload_b64: str,
+        schema_version: int = 2,
     ) -> None:
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         payload_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
@@ -559,11 +683,19 @@ class BotDB:
                 """
                 insert into encrypted_feedback_samples(
                     chat_id, telegram_message_id, payload_json_sha256,
-                    encrypted_payload_b64, created_at
+                    encrypted_payload_b64, encrypted_bytes, schema_version, created_at
                 )
-                values (?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (chat_id, telegram_message_id, payload_hash, encrypted_payload_b64, utc_now()),
+                (
+                    chat_id,
+                    telegram_message_id,
+                    payload_hash,
+                    encrypted_payload_b64,
+                    len(encrypted_payload_b64),
+                    schema_version,
+                    utc_now(),
+                ),
             )
             self._conn.commit()
 
@@ -694,3 +826,147 @@ class BotDB:
             """,
             (chat_id, telegram_message_id),
         )
+
+    @staticmethod
+    def _ids_outside_caps(
+        rows: list[sqlite3.Row], *, max_rows: int, max_bytes: int
+    ) -> list[int]:
+        retained_rows = 0
+        retained_bytes = 0
+        delete_ids: list[int] = []
+        for row in rows:
+            row_bytes = int(row["stored_bytes"])
+            if retained_rows >= max_rows or retained_bytes + row_bytes > max_bytes:
+                delete_ids.append(int(row["id"]))
+                continue
+            retained_rows += 1
+            retained_bytes += row_bytes
+        return delete_ids
+
+    def _delete_ids(self, table: str, ids: list[int], *, batch_size: int = 500) -> int:
+        if table not in {"encrypted_feedback_samples", "encrypted_feedback_media"}:
+            raise ValueError("unsupported retention table")
+        deleted = 0
+        for offset in range(0, len(ids), batch_size):
+            batch = ids[offset : offset + batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            cursor = self._conn.execute(
+                f"delete from {table} where id in ({placeholders})",
+                batch,
+            )
+            deleted += cursor.rowcount
+        return deleted
+
+    def prune_feedback(
+        self,
+        *,
+        unreacted_ttl_seconds: int,
+        unreacted_max_rows: int,
+        unreacted_max_bytes: int,
+        reacted_max_rows: int,
+        reacted_max_bytes: int,
+        media_max_bytes: int,
+    ) -> dict[str, int]:
+        cutoff = (datetime.now(UTC) - timedelta(seconds=unreacted_ttl_seconds)).replace(
+            microsecond=0
+        ).isoformat()
+        deleted = {"samples": 0, "media": 0, "events": 0, "outbound": 0}
+        with self._lock:
+            cursor = self._conn.execute(
+                "delete from encrypted_feedback_samples "
+                "where reaction_event_id is null and created_at <= ?",
+                (cutoff,),
+            )
+            deleted["samples"] += cursor.rowcount
+
+            for where, max_rows, max_bytes in (
+                ("reaction_event_id is null", unreacted_max_rows, unreacted_max_bytes),
+                ("reaction_event_id is not null", reacted_max_rows, reacted_max_bytes),
+            ):
+                rows = self._conn.execute(
+                    f"select id, encrypted_bytes as stored_bytes "
+                    f"from encrypted_feedback_samples where {where} "
+                    "order by created_at desc, id desc"
+                ).fetchall()
+                delete_ids = self._ids_outside_caps(
+                    rows, max_rows=max_rows, max_bytes=max_bytes
+                )
+                if delete_ids:
+                    deleted["samples"] += self._delete_ids(
+                        "encrypted_feedback_samples",
+                        delete_ids,
+                    )
+
+            media_rows = self._conn.execute(
+                "select id, length(encrypted_payload_b64) as stored_bytes "
+                "from encrypted_feedback_media order by created_at desc, id desc"
+            ).fetchall()
+            media_delete_ids = self._ids_outside_caps(
+                media_rows,
+                max_rows=len(media_rows),
+                max_bytes=media_max_bytes,
+            )
+            if media_delete_ids:
+                deleted["media"] += self._delete_ids(
+                    "encrypted_feedback_media",
+                    media_delete_ids,
+                )
+
+            cursor = self._conn.execute(
+                """
+                delete from reaction_events
+                where not exists (
+                    select 1 from encrypted_feedback_samples sample
+                    where sample.chat_id = reaction_events.chat_id
+                      and sample.telegram_message_id = reaction_events.telegram_message_id
+                ) and not exists (
+                    select 1 from encrypted_feedback_media media
+                    where media.chat_id = reaction_events.chat_id
+                      and media.telegram_message_id = reaction_events.telegram_message_id
+                )
+                """
+            )
+            deleted["events"] += cursor.rowcount
+            cursor = self._conn.execute(
+                """
+                delete from outbound_messages
+                where created_at <= ? and not exists (
+                    select 1 from encrypted_feedback_samples sample
+                    where sample.chat_id = outbound_messages.chat_id
+                      and sample.telegram_message_id = outbound_messages.telegram_message_id
+                ) and not exists (
+                    select 1 from encrypted_feedback_media media
+                    where media.chat_id = outbound_messages.chat_id
+                      and media.telegram_message_id = outbound_messages.telegram_message_id
+                )
+                """,
+                (cutoff,),
+            )
+            deleted["outbound"] += cursor.rowcount
+            self._conn.commit()
+            self._conn.execute("pragma wal_checkpoint(truncate)")
+            self._conn.execute("pragma incremental_vacuum")
+        return deleted
+
+    def feedback_stats(self) -> dict[str, int]:
+        with self._lock:
+            unreacted = self._conn.execute(
+                "select count(*), coalesce(sum(encrypted_bytes), 0) "
+                "from encrypted_feedback_samples where reaction_event_id is null"
+            ).fetchone()
+            reacted = self._conn.execute(
+                "select count(*), coalesce(sum(encrypted_bytes), 0) "
+                "from encrypted_feedback_samples where reaction_event_id is not null"
+            ).fetchone()
+            media = self._conn.execute(
+                "select count(*), coalesce(sum(length(encrypted_payload_b64)), 0) "
+                "from encrypted_feedback_media"
+            ).fetchone()
+        return {
+            "unreacted_rows": int(unreacted[0]),
+            "unreacted_bytes": int(unreacted[1]),
+            "reacted_rows": int(reacted[0]),
+            "reacted_bytes": int(reacted[1]),
+            "media_rows": int(media[0]),
+            "media_bytes": int(media[1]),
+        }
