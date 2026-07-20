@@ -154,6 +154,14 @@ triggers the message. Replying with text to an image also sends the replied-to
 image. Standalone unaddressed images remain silent. Input is limited to one
 image and 10 MB.
 
+Static Telegram stickers are analyzed from their original WebP. Animated TGS
+and video WebM stickers are analyzed from Telegram's WebP/JPEG thumbnail; the
+animation itself is not rendered. A sticker replying to the bot triggers
+generation, and text or `/gpt` replying to a sticker analyzes it. Other
+standalone stickers remain silent. Sticker format, representation, emoji, and
+set name are retained only in the encrypted feedback payload and are not added
+to the model prompt.
+
 Generated output is split below Telegram's message limit. ASCII `@` is removed
 before sending so model output cannot notify usernames.
 
@@ -236,6 +244,7 @@ Before any reaction, each answer stores sealed schema-v2 ciphertext containing:
 - complete request messages and retained chat context;
 - model profile, generation settings, and API URL;
 - model/projector hashes, llama.cpp revision, and context-fit metadata;
+- image/sticker source metadata and sticker preview provenance;
 - complete API response and final Telegram answer.
 
 Image content is represented by a hash in the JSON payload. The encrypted image

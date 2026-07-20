@@ -164,9 +164,12 @@ Required bot policy:
 
 ## Telegram Usage
 
-The bot answers `/gpt`, replies to the bot, mentions, and supported image
-triggers. JPEG, PNG, and WebP inputs are limited to 10 MB. Generated `@`
-characters are stripped to avoid username notifications.
+The bot answers `/gpt`, replies to the bot, mentions, and supported image or
+sticker triggers. JPEG, PNG, WebP, and Telegram stickers are limited by the
+configured 10 MB media cap. Static stickers use their original WebP;
+animated/video stickers use Telegram's preview image. Standalone unaddressed
+stickers remain silent. Generated `@` characters are stripped to avoid username
+notifications.
 
 Generation uses one model worker and a bounded FIFO queue by default. Concurrent
 requests receive a temporary queue position instead of a model-busy error;

@@ -61,6 +61,7 @@ class DownloadedImage:
     data: bytes
     mime_type: str
     filename: str | None
+    media_metadata: dict[str, Any]
 
 
 def _services(
@@ -265,7 +266,9 @@ def _has_image(message: Message | None) -> bool:
         return False
     if message.photo:
         return True
-    return bool(message.document and message.document.mime_type in ALLOWED_IMAGE_MIME_TYPES)
+    if message.document and message.document.mime_type in ALLOWED_IMAGE_MIME_TYPES:
+        return True
+    return getattr(message, "sticker", None) is not None
 
 
 def _image_source(message: Message) -> Message | None:
@@ -299,25 +302,88 @@ async def _text_message_is_trigger(
     )
 
 
-async def _download_image(message: Message, context: ContextTypes.DEFAULT_TYPE) -> DownloadedImage:
+async def _download_image(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> DownloadedImage:
     config, *_ = _services(context)
+    sticker = getattr(message, "sticker", None)
+    sticker_format: str | None = None
+    sticker_representation: str | None = None
     if message.photo:
         media = message.photo[-1]
         mime_type = "image/jpeg"
         filename = f"telegram-{media.file_unique_id}.jpg"
+        media_kind = "telegram_photo"
     elif message.document and message.document.mime_type in ALLOWED_IMAGE_MIME_TYPES:
         media = message.document
         mime_type = message.document.mime_type
         filename = message.document.file_name
+        media_kind = "telegram_document"
+    elif sticker is not None:
+        media_kind = "telegram_sticker"
+        sticker_format = (
+            "video"
+            if sticker.is_video
+            else "animated"
+            if sticker.is_animated
+            else "static"
+        )
+        if sticker_format == "static":
+            media = sticker
+            mime_type = "image/webp"
+            filename = f"telegram-sticker-{sticker.file_unique_id}.webp"
+            sticker_representation = "original"
+        else:
+            media = sticker.thumbnail
+            if media is None:
+                raise ValueError(f"{sticker_format} sticker preview is unavailable")
+            mime_type = ""
+            filename = None
+            sticker_representation = "thumbnail"
     else:
-        raise ValueError("supported image types: JPEG, PNG, WebP")
+        raise ValueError("supported media types: JPEG, PNG, WebP, sticker")
     if media.file_size and media.file_size > config.image_max_bytes:
-        raise ValueError("image exceeds the 10 MB limit")
+        raise ValueError("media exceeds the configured size limit")
     telegram_file = await context.bot.get_file(media.file_id)
     data = bytes(await telegram_file.download_as_bytearray())
     if len(data) > config.image_max_bytes:
-        raise ValueError("image exceeds the 10 MB limit")
-    return DownloadedImage(data=data, mime_type=mime_type, filename=filename)
+        raise ValueError("media exceeds the configured size limit")
+    if sticker is not None:
+        detected_mime_type = _detect_sticker_image_mime(data)
+        if sticker_format == "static" and detected_mime_type != "image/webp":
+            raise ValueError("static sticker file is not WebP")
+        if sticker_representation == "thumbnail":
+            mime_type = detected_mime_type
+            extension = "jpg" if mime_type == "image/jpeg" else "webp"
+            filename = f"telegram-sticker-{sticker.file_unique_id}-preview.{extension}"
+    media_metadata: dict[str, Any] = {
+        "kind": media_kind,
+        "mime_type": mime_type,
+        "filename": filename,
+    }
+    if sticker is not None:
+        media_metadata["sticker"] = {
+            "emoji": sticker.emoji,
+            "set_name": sticker.set_name,
+            "type": str(getattr(sticker.type, "value", sticker.type)),
+            "format": sticker_format,
+            "representation": sticker_representation,
+        }
+    return DownloadedImage(
+        data=data,
+        mime_type=mime_type,
+        filename=filename,
+        media_metadata=media_metadata,
+    )
+
+
+def _detect_sticker_image_mime(data: bytes) -> str:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    raise ValueError("sticker preview must be JPEG or WebP")
 
 
 async def remember_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -524,8 +590,13 @@ async def _generate_and_reply_inner(
     image_source = _image_source(message)
     try:
         image = await _download_image(image_source, context) if image_source else None
-    except (ValueError, httpx.HTTPError) as exc:
-        await message.reply_text(f"image rejected: {exc}")
+    except (ValueError, httpx.HTTPError, TelegramError) as exc:
+        media_label = (
+            "sticker"
+            if image_source and getattr(image_source, "sticker", None) is not None
+            else "image"
+        )
+        await message.reply_text(f"{media_label} rejected: {exc}")
         return
     messages = await _build_messages(
         trigger_message=message,
@@ -571,6 +642,7 @@ async def _generate_and_reply_inner(
             "from_user_label": _user_label(message.from_user),
             "text": _message_content(message),
             "has_image": image is not None,
+            "media": image.media_metadata if image else None,
         },
         "api_request": {
             "messages": _feedback_messages(messages),
