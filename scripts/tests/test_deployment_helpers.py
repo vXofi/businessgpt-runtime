@@ -112,6 +112,7 @@ bookkeeping.example {
                 bot_values["BUSINESSGPT_BOT_ALLOWED_API_URLS"],
             )
             self.assertEqual(migrated["BUSINESSGPT_BOT_RECENT_CONTEXT_MESSAGES"], "20")
+            self.assertEqual(migrated["BUSINESSGPT_BOT_GENERATION_QUEUE_SIZE"], "8")
             self.assertNotIn("api-secret", output.getvalue())
             self.assertNotIn("bot-secret", output.getvalue())
 

@@ -49,6 +49,7 @@ class ConfigTests(unittest.TestCase):
             frozenset({"http://businessgpt-api:8000/generate"}),
         )
         self.assertEqual(config.default_recent_context_messages, 10)
+        self.assertEqual(config.generation_queue_size, 8)
 
 
 if __name__ == "__main__":

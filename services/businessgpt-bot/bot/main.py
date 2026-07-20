@@ -31,7 +31,7 @@ from .crypto import FeedbackEncryptor
 from .context_cache import ContextCache
 from .db import BotDB
 from .media_cache import EncryptedMediaCache
-from .limits import GenerationLimiter
+from .limits import GenerationQueue
 from .validation import validate_allowed_api_url
 from .handlers import (
     authorize_update,
@@ -157,6 +157,7 @@ async def post_init(application: Application) -> None:
                 )
     except TelegramError as exc:
         logger.warning("could not register Telegram command menu: %s", exc)
+    application.bot_data["generation_queue"].start()
     logger.info(
         "bot initialized username=%s telegram_proxy=%s",
         me.username,
@@ -167,6 +168,7 @@ async def post_init(application: Application) -> None:
 async def post_shutdown(application: Application) -> None:
     api: BusinessGPTClient = application.bot_data["businessgpt"]
     db: BotDB = application.bot_data["db"]
+    generation_queue: GenerationQueue = application.bot_data["generation_queue"]
     maintenance_task = application.bot_data.get("maintenance_task")
     if maintenance_task:
         maintenance_task.cancel()
@@ -174,6 +176,7 @@ async def post_shutdown(application: Application) -> None:
             await maintenance_task
         except asyncio.CancelledError:
             pass
+    await generation_queue.shutdown()
     await api.close()
     db.close()
 
@@ -234,8 +237,9 @@ def build_application(config: Config) -> Application:
         max_chats=config.context_cache_max_chats,
         ttl_seconds=config.context_cache_ttl_seconds,
     )
-    application.bot_data["generation_limiter"] = GenerationLimiter(
+    application.bot_data["generation_queue"] = GenerationQueue(
         max_concurrent=config.max_concurrent_generations,
+        max_queue_size=config.generation_queue_size,
         user_requests=config.rate_limit_user_requests,
         chat_requests=config.rate_limit_chat_requests,
         window_seconds=config.rate_limit_window_seconds,

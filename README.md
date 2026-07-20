@@ -168,6 +168,10 @@ The bot answers `/gpt`, replies to the bot, mentions, and supported image
 triggers. JPEG, PNG, and WebP inputs are limited to 10 MB. Generated `@`
 characters are stripped to avoid username notifications.
 
+Generation uses one model worker and a bounded FIFO queue by default. Concurrent
+requests receive a temporary queue position instead of a model-busy error;
+`/status` shows active and queued job counts.
+
 Use these first:
 
 ```text

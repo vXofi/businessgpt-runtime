@@ -70,6 +70,7 @@ class Config:
     context_cache_max_chats: int
     context_cache_ttl_seconds: int
     max_concurrent_generations: int
+    generation_queue_size: int
     rate_limit_user_requests: int
     rate_limit_chat_requests: int
     rate_limit_window_seconds: int
@@ -165,6 +166,9 @@ class Config:
             ),
             max_concurrent_generations=_positive_int(
                 "BUSINESSGPT_BOT_MAX_CONCURRENT_GENERATIONS", 1
+            ),
+            generation_queue_size=_positive_int(
+                "BUSINESSGPT_BOT_GENERATION_QUEUE_SIZE", 8
             ),
             rate_limit_user_requests=_positive_int(
                 "BUSINESSGPT_BOT_RATE_USER_REQUESTS", 3

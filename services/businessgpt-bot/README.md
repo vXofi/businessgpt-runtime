@@ -217,10 +217,12 @@ selected context included in a generated answer is copied into that answer's
 encrypted feedback payload, so reaction-selected training samples remain
 self-contained after the RAM cache expires.
 
-The bot handles ordinary Telegram updates concurrently while a generation is
-running. Generation itself defaults to one active job, three requests per user
-per minute, and ten requests per chat per minute. Busy work is rejected quickly
-instead of blocking settings and reaction handling behind a long model call.
+The bot handles ordinary Telegram updates concurrently while generation jobs
+run in a bounded in-memory FIFO queue. Generation defaults to one active job,
+eight waiting jobs, three accepted requests per user per minute, and ten per
+chat per minute. A queued user sees a temporary position message, which is
+deleted when their generation starts. Only a full queue or a rate limit rejects
+new work, so settings and reactions remain responsive behind a long model call.
 
 ## Reaction Data And Retention
 

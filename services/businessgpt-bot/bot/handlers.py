@@ -21,6 +21,7 @@ from .config import Config
 from .context_cache import CachedMessage, ContextCache
 from .crypto import FeedbackEncryptor
 from .db import BotDB, validate_name
+from .limits import GenerationQueue
 from .media_cache import EncryptedMediaCache
 from .tools import TOOL_REGISTRY
 from .validation import validate_allowed_api_url, validate_generation_settings
@@ -425,21 +426,49 @@ async def _generate_and_reply(
     if target_chat_id not in config.allowed_chat_ids:
         await message.reply_text("not allowed")
         return
-    limiter = context.application.bot_data["generation_limiter"]
-    admission = await limiter.try_start(chat_id=target_chat_id, user_id=user.id)
+    generation_queue: GenerationQueue = context.application.bot_data["generation_queue"]
+    setup_done = asyncio.Event()
+    queue_notice: Message | None = None
+
+    async def run_generation() -> None:
+        await setup_done.wait()
+        if queue_notice is not None:
+            with suppress(asyncio.TimeoutError, TelegramError):
+                await asyncio.wait_for(queue_notice.delete(), timeout=5)
+        try:
+            await _generate_and_reply_inner(
+                update=update,
+                context=context,
+                user_text=user_text,
+                prompt_override_name=prompt_override_name,
+                settings_chat_id=target_chat_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "generation job failed chat_id=%s user_id=%s",
+                target_chat_id,
+                user.id,
+            )
+            with suppress(TelegramError):
+                await message.reply_text("generation failed: internal error")
+
+    admission = await generation_queue.submit(
+        chat_id=target_chat_id,
+        user_id=user.id,
+        run=run_generation,
+    )
     if not admission.allowed:
         await message.reply_text(f"generation unavailable: {admission.reason}")
         return
     try:
-        await _generate_and_reply_inner(
-            update=update,
-            context=context,
-            user_text=user_text,
-            prompt_override_name=prompt_override_name,
-            settings_chat_id=target_chat_id,
-        )
+        if admission.queued:
+            queue_notice = await message.reply_text(
+                f"generation queued: position {admission.position}"
+            )
     finally:
-        await limiter.finish()
+        setup_done.set()
 
 
 async def _generate_and_reply_inner(
@@ -1193,7 +1222,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     prompt = db.get_active_prompt(target); model = db.get_active_model_profile(target); values = db.get_effective_generation_settings(target)
     bot_id, username = await _bot_identity(context)
     stats = db.feedback_stats()
-    await _reply(message, "\n".join([f"bot: @{username} ({bot_id})" if username else f"bot: {bot_id}", f"db: {config.db_path}", f"settings_chat: {target}", f"active_prompt: {prompt['name'] if prompt else 'api-default'}", f"active_model: {model['name']}", f"context_messages: {values['recent_context_messages']}", f"feedback_pending: {stats['unreacted_rows']}", f"feedback_reacted: {stats['reacted_rows']}", f"feedback_media: {stats['media_rows']}"]))
+    generation_queue: GenerationQueue = context.application.bot_data["generation_queue"]
+    await _reply(message, "\n".join([f"bot: @{username} ({bot_id})" if username else f"bot: {bot_id}", f"db: {config.db_path}", f"settings_chat: {target}", f"active_prompt: {prompt['name'] if prompt else 'api-default'}", f"active_model: {model['name']}", f"context_messages: {values['recent_context_messages']}", f"generation_active: {generation_queue.active}", f"generation_queued: {generation_queue.pending}", f"feedback_pending: {stats['unreacted_rows']}", f"feedback_reacted: {stats['reacted_rows']}", f"feedback_media: {stats['media_rows']}"]))
 
 
 async def tools_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
