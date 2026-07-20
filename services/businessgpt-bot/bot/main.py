@@ -225,6 +225,8 @@ def build_application(config: Config) -> Application:
     db = BotDB(
         config.db_path,
         default_recent_context_messages=config.default_recent_context_messages,
+        default_rate_limit_user_requests=config.rate_limit_user_requests,
+        default_rate_limit_chat_requests=config.rate_limit_chat_requests,
     )
     encryptor = FeedbackEncryptor(config.feedback_public_key_b64)
     application.bot_data["db"] = db

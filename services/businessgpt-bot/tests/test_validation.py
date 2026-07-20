@@ -4,6 +4,7 @@ import unittest
 from bot.validation import (
     normalize_api_url,
     validate_allowed_api_url,
+    validate_admission_value,
     validate_generation_value,
 )
 
@@ -37,6 +38,12 @@ class ValidationTests(unittest.TestCase):
         for value in (math.nan, math.inf, -1, 3):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 validate_generation_value("temperature", value)
+
+    def test_admission_limits_require_bounded_positive_integers(self):
+        self.assertEqual(validate_admission_value("rate_limit_user_requests", 5), 5)
+        for value in (0, 1.5, math.nan, 101):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_admission_value("rate_limit_user_requests", value)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,10 @@ INTEGER_GENERATION_FIELDS = {
     "max_tokens",
     "top_k",
 }
+ADMISSION_RANGES: dict[str, tuple[int, int]] = {
+    "rate_limit_user_requests": (1, 100),
+    "rate_limit_chat_requests": (1, 200),
+}
 
 
 def normalize_api_url(value: str) -> str:
@@ -67,3 +71,25 @@ def validate_generation_value(field: str, value: Any) -> int | float:
 
 def validate_generation_settings(**values: Any) -> dict[str, int | float]:
     return {name: validate_generation_value(name, value) for name, value in values.items()}
+
+
+def validate_admission_value(field: str, value: Any) -> int:
+    bounds = ADMISSION_RANGES.get(field)
+    if bounds is None:
+        raise ValueError(f"unsupported admission setting: {field}")
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be an integer") from exc
+    if not math.isfinite(number) or not number.is_integer():
+        raise ValueError(f"{field} must be a finite integer")
+    minimum, maximum = bounds
+    if number < minimum or number > maximum:
+        raise ValueError(f"{field} must be between {minimum} and {maximum}")
+    return int(number)
+
+
+def validate_admission_settings(**values: Any) -> dict[str, int]:
+    return {name: validate_admission_value(name, value) for name, value in values.items()}

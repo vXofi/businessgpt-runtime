@@ -169,7 +169,8 @@ The `/settings` menu shows the active prompt and model names. Press the prompt
 button to preview actual prompt text; API-default text is fetched from the
 authenticated API. Group settings offer an encoded private-editor link for
 prompt creation/editing. Context choices are `0`, `5`, `10`, and `20`, with 10
-as the default.
+as the default. Group admins can also select per-user request limits of `1`,
+`3`, `5`, `10`, or `20`, and per-chat limits of `5`, `10`, `20`, `30`, or `50`.
 
 Prompt presets are scoped per group:
 
@@ -223,6 +224,9 @@ eight waiting jobs, three accepted requests per user per minute, and ten per
 chat per minute. A queued user sees a temporary position message, which is
 deleted when their generation starts. Only a full queue or a rate limit rejects
 new work, so settings and reactions remain responsive behind a long model call.
+The two request counts are environment defaults and can be overridden per group
+through `/settings`; the time window, worker count, and queue size remain global
+infrastructure settings. The user limit is tracked independently in each group.
 
 ## Reaction Data And Retention
 

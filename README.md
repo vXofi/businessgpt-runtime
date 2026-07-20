@@ -170,7 +170,7 @@ characters are stripped to avoid username notifications.
 
 Generation uses one model worker and a bounded FIFO queue by default. Concurrent
 requests receive a temporary queue position instead of a model-busy error;
-`/status` shows active and queued job counts.
+`/status` shows active and queued job counts plus the effective request limits.
 
 Use these first:
 
@@ -181,9 +181,12 @@ Use these first:
 ```
 
 `/settings` exposes per-group prompt selection and preview, model selection,
-context depth (`0`, `5`, `10`, or `20`), and bounded sampling controls. Prompt
-presets are scoped per group. Pending two-message editors expire after 15
-minutes and can be cancelled with `/cancel`.
+context depth (`0`, `5`, `10`, or `20`), bounded sampling controls, and
+per-user/per-chat request limits. The environment rate values are defaults;
+group admins can override the request counts without restarting the bot. The
+rate window, worker count, and queue capacity remain server-level settings.
+Prompt presets are scoped per group. Pending two-message editors expire after
+15 minutes and can be cancelled with `/cancel`.
 
 The default context depth is 10 recent messages. The live context cache is RAM
 only, limited by chat count and TTL, and cleared on restart.

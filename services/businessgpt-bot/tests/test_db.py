@@ -121,6 +121,40 @@ class BotDBTest(unittest.TestCase):
             self.assertEqual(settings["top_k"], 50)
             db.close()
 
+    def test_chat_rate_limits_inherit_defaults_and_support_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = BotDB(
+                str(Path(tmp) / "bot.sqlite3"),
+                default_rate_limit_user_requests=4,
+                default_rate_limit_chat_requests=12,
+            )
+            db.migrate()
+
+            self.assertEqual(
+                db.get_effective_admission_settings(100),
+                {
+                    "rate_limit_user_requests": 4,
+                    "rate_limit_chat_requests": 12,
+                },
+            )
+            db.set_chat_setting(100, "rate_limit_user_requests", 10)
+            db.set_chat_setting(100, "rate_limit_chat_requests", 30)
+
+            self.assertEqual(
+                db.get_effective_admission_settings(100),
+                {
+                    "rate_limit_user_requests": 10,
+                    "rate_limit_chat_requests": 30,
+                },
+            )
+            self.assertEqual(
+                db.get_effective_admission_settings(200)[
+                    "rate_limit_user_requests"
+                ],
+                4,
+            )
+            db.close()
+
     def test_migrates_existing_schema_without_data_loss(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "bot.sqlite3"
@@ -151,6 +185,8 @@ class BotDBTest(unittest.TestCase):
             settings = db.get_chat_settings(99)
             self.assertEqual(settings["recent_context_messages"], 10)
             self.assertIn("top_k", settings.keys())
+            self.assertIn("rate_limit_user_requests", settings.keys())
+            self.assertIn("rate_limit_chat_requests", settings.keys())
             db.close()
 
     def test_pending_actions_expire_without_being_popped_early(self):

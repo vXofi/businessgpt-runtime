@@ -137,6 +137,53 @@ class GenerationQueueTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         await asyncio.wait_for(queue.join(), timeout=1)
 
+    async def test_submission_can_override_default_user_limit(self):
+        queue = self.make_queue(user_requests=1)
+
+        async def no_op() -> None:
+            return None
+
+        first = await queue.submit(
+            chat_id=-1,
+            user_id=1,
+            run=no_op,
+            user_requests=2,
+        )
+        await queue.join()
+        second = await queue.submit(
+            chat_id=-1,
+            user_id=1,
+            run=no_op,
+            user_requests=2,
+        )
+        await queue.join()
+        limited = await queue.submit(
+            chat_id=-1,
+            user_id=1,
+            run=no_op,
+            user_requests=2,
+        )
+
+        self.assertTrue(first.allowed)
+        self.assertTrue(second.allowed)
+        self.assertEqual(limited.reason, "user rate limit reached")
+
+    async def test_user_rate_is_scoped_to_chat(self):
+        queue = self.make_queue(user_requests=1)
+
+        async def no_op() -> None:
+            return None
+
+        first = await queue.submit(chat_id=-1, user_id=1, run=no_op)
+        await queue.join()
+        limited = await queue.submit(chat_id=-1, user_id=1, run=no_op)
+        other_chat = await queue.submit(chat_id=-2, user_id=1, run=no_op)
+
+        self.assertTrue(first.allowed)
+        self.assertEqual(limited.reason, "user rate limit reached")
+        self.assertTrue(other_chat.allowed)
+        await queue.join()
+
 
 if __name__ == "__main__":
     unittest.main()

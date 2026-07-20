@@ -36,7 +36,12 @@ SETTING_OPTIONS: dict[str, tuple[int | float, ...]] = {
     "top_p": (0.7, 0.8, 0.9, 0.95, 1.0),
     "top_k": (0, 20, 40, 50, 80, 100),
     "repetition_penalty": (1.0, 1.05, 1.1, 1.2, 1.3),
+    "rate_limit_user_requests": (1, 3, 5, 10, 20),
+    "rate_limit_chat_requests": (5, 10, 20, 30, 50),
 }
+ADMISSION_SETTING_FIELDS = frozenset(
+    {"rate_limit_user_requests", "rate_limit_chat_requests"}
+)
 SETTING_LABELS = {
     "recent_context_messages": "Context",
     "max_tokens": "Max tokens",
@@ -44,6 +49,8 @@ SETTING_LABELS = {
     "top_p": "Top P",
     "top_k": "Top K",
     "repetition_penalty": "Repeat penalty",
+    "rate_limit_user_requests": "Requests per user",
+    "rate_limit_chat_requests": "Requests per chat",
 }
 
 logger = logging.getLogger(__name__)
@@ -427,6 +434,7 @@ async def _generate_and_reply(
         await message.reply_text("not allowed")
         return
     generation_queue: GenerationQueue = context.application.bot_data["generation_queue"]
+    rate_limits = db.get_effective_admission_settings(target_chat_id)
     setup_done = asyncio.Event()
     queue_notice: Message | None = None
 
@@ -458,6 +466,8 @@ async def _generate_and_reply(
         chat_id=target_chat_id,
         user_id=user.id,
         run=run_generation,
+        user_requests=rate_limits["rate_limit_user_requests"],
+        chat_requests=rate_limits["rate_limit_chat_requests"],
     )
     if not admission.allowed:
         await message.reply_text(f"generation unavailable: {admission.reason}")
@@ -791,10 +801,12 @@ def _settings_view(
     *,
     bot_username: str | None,
     private: bool,
+    rate_window_seconds: int = 60,
 ) -> tuple[str, InlineKeyboardMarkup]:
     prompt = db.get_active_prompt(chat_id)
     model = db.get_active_model_profile(chat_id)
     values = db.get_effective_generation_settings(chat_id)
+    rate_limits = db.get_effective_admission_settings(chat_id)
     prompt_name = prompt["name"] if prompt else "API default"
     model_name = model["name"]
     text = "\n".join(
@@ -808,6 +820,8 @@ def _settings_view(
             f"Top P: {values['top_p']}",
             f"Top K: {values['top_k']}",
             f"Repeat penalty: {values['repetition_penalty']}",
+            f"User rate: {rate_limits['rate_limit_user_requests']}/{rate_window_seconds}s",
+            f"Chat rate: {rate_limits['rate_limit_chat_requests']}/{rate_window_seconds}s",
             "",
             "Prompt editing works here; model endpoint editing requires an owner."
             if private else "Open the private editor for prompt management.",
@@ -824,9 +838,56 @@ def _settings_view(
                 callback_data=_settings_callback_data(chat_id, "models"),
             ),
         ],
-        [InlineKeyboardButton(f"Context {values['recent_context_messages']}", callback_data=_settings_callback_data(chat_id, "field:recent_context_messages")), InlineKeyboardButton(f"Max {values['max_tokens']}", callback_data=_settings_callback_data(chat_id, "field:max_tokens"))],
-        [InlineKeyboardButton(f"Temp {values['temperature']}", callback_data=_settings_callback_data(chat_id, "field:temperature")), InlineKeyboardButton(f"Top P {values['top_p']}", callback_data=_settings_callback_data(chat_id, "field:top_p"))],
-        [InlineKeyboardButton(f"Top K {values['top_k']}", callback_data=_settings_callback_data(chat_id, "field:top_k")), InlineKeyboardButton(f"Repeat {values['repetition_penalty']}", callback_data=_settings_callback_data(chat_id, "field:repetition_penalty"))],
+        [
+            InlineKeyboardButton(
+                f"Context {values['recent_context_messages']}",
+                callback_data=_settings_callback_data(
+                    chat_id, "field:recent_context_messages"
+                ),
+            ),
+            InlineKeyboardButton(
+                f"Max {values['max_tokens']}",
+                callback_data=_settings_callback_data(chat_id, "field:max_tokens"),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"Temp {values['temperature']}",
+                callback_data=_settings_callback_data(chat_id, "field:temperature"),
+            ),
+            InlineKeyboardButton(
+                f"Top P {values['top_p']}",
+                callback_data=_settings_callback_data(chat_id, "field:top_p"),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"Top K {values['top_k']}",
+                callback_data=_settings_callback_data(chat_id, "field:top_k"),
+            ),
+            InlineKeyboardButton(
+                f"Repeat {values['repetition_penalty']}",
+                callback_data=_settings_callback_data(
+                    chat_id, "field:repetition_penalty"
+                ),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"User/{rate_window_seconds}s "
+                f"{rate_limits['rate_limit_user_requests']}",
+                callback_data=_settings_callback_data(
+                    chat_id, "field:rate_limit_user_requests"
+                ),
+            ),
+            InlineKeyboardButton(
+                f"Chat/{rate_window_seconds}s "
+                f"{rate_limits['rate_limit_chat_requests']}",
+                callback_data=_settings_callback_data(
+                    chat_id, "field:rate_limit_chat_requests"
+                ),
+            ),
+        ],
     ]
     if not private and bot_username:
         rows.append([InlineKeyboardButton("Edit in private chat", url=f"https://t.me/{bot_username}?start=settings_{_encode_chat_id(chat_id)}")])
@@ -840,7 +901,13 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     message = update.effective_message
     target = _target_chat_id(message, update.effective_user, db, config)
     _, username = await _bot_identity(context)
-    text, keyboard = _settings_view(db, target, bot_username=username, private=message.chat.type == ChatType.PRIVATE)
+    text, keyboard = _settings_view(
+        db,
+        target,
+        bot_username=username,
+        private=message.chat.type == ChatType.PRIVATE,
+        rate_window_seconds=config.rate_limit_window_seconds,
+    )
     await message.reply_text(text, reply_markup=keyboard)
 
 
@@ -1044,7 +1111,11 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if field not in SETTING_OPTIONS:
             await query.answer("unknown setting", show_alert=True)
             return
-        values = db.get_effective_generation_settings(target)
+        values = (
+            db.get_effective_admission_settings(target)
+            if field in ADMISSION_SETTING_FIELDS
+            else db.get_effective_generation_settings(target)
+        )
         buttons = [
             InlineKeyboardButton(
                 ("* " if option == values[field] else "") + str(option),
@@ -1092,7 +1163,13 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.answer()
         return
     _, username = await _bot_identity(context)
-    text, keyboard = _settings_view(db, target, bot_username=username, private=query.message.chat.type == ChatType.PRIVATE)
+    text, keyboard = _settings_view(
+        db,
+        target,
+        bot_username=username,
+        private=query.message.chat.type == ChatType.PRIVATE,
+        rate_window_seconds=config.rate_limit_window_seconds,
+    )
     await query.edit_message_text(text, reply_markup=keyboard)
     await query.answer("saved" if data.startswith(("set:", "prompt:", "model:")) else None)
 
@@ -1216,14 +1293,40 @@ async def model_delete_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _require_admin(update, context): return
-    config, db, *_ = _services(context); message = update.effective_message
+    if not await _require_admin(update, context):
+        return
+    config, db, *_ = _services(context)
+    message = update.effective_message
     target = _target_chat_id(message, update.effective_user, db, config)
-    prompt = db.get_active_prompt(target); model = db.get_active_model_profile(target); values = db.get_effective_generation_settings(target)
+    prompt = db.get_active_prompt(target)
+    model = db.get_active_model_profile(target)
+    values = db.get_effective_generation_settings(target)
+    rate_limits = db.get_effective_admission_settings(target)
     bot_id, username = await _bot_identity(context)
     stats = db.feedback_stats()
     generation_queue: GenerationQueue = context.application.bot_data["generation_queue"]
-    await _reply(message, "\n".join([f"bot: @{username} ({bot_id})" if username else f"bot: {bot_id}", f"db: {config.db_path}", f"settings_chat: {target}", f"active_prompt: {prompt['name'] if prompt else 'api-default'}", f"active_model: {model['name']}", f"context_messages: {values['recent_context_messages']}", f"generation_active: {generation_queue.active}", f"generation_queued: {generation_queue.pending}", f"feedback_pending: {stats['unreacted_rows']}", f"feedback_reacted: {stats['reacted_rows']}", f"feedback_media: {stats['media_rows']}"]))
+    await _reply(
+        message,
+        "\n".join(
+            [
+                f"bot: @{username} ({bot_id})" if username else f"bot: {bot_id}",
+                f"db: {config.db_path}",
+                f"settings_chat: {target}",
+                f"active_prompt: {prompt['name'] if prompt else 'api-default'}",
+                f"active_model: {model['name']}",
+                f"context_messages: {values['recent_context_messages']}",
+                f"user_rate_limit: {rate_limits['rate_limit_user_requests']}"
+                f"/{config.rate_limit_window_seconds}s",
+                f"chat_rate_limit: {rate_limits['rate_limit_chat_requests']}"
+                f"/{config.rate_limit_window_seconds}s",
+                f"generation_active: {generation_queue.active}",
+                f"generation_queued: {generation_queue.pending}",
+                f"feedback_pending: {stats['unreacted_rows']}",
+                f"feedback_reacted: {stats['reacted_rows']}",
+                f"feedback_media: {stats['media_rows']}",
+            ]
+        ),
+    )
 
 
 async def tools_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

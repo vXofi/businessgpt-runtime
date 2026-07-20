@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 GenerationJob = Callable[[], Awaitable[None]]
+RateKey = int | tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -54,8 +55,8 @@ class GenerationQueue:
         self._outstanding = 0
         self._accepting = False
         self._workers: list[asyncio.Task[None]] = []
-        self._user_events: OrderedDict[int, deque[float]] = OrderedDict()
-        self._chat_events: OrderedDict[int, deque[float]] = OrderedDict()
+        self._user_events: OrderedDict[RateKey, deque[float]] = OrderedDict()
+        self._chat_events: OrderedDict[RateKey, deque[float]] = OrderedDict()
         self._lock = asyncio.Lock()
 
     @property
@@ -80,8 +81,8 @@ class GenerationQueue:
 
     def _events_for_key(
         self,
-        mapping: OrderedDict[int, deque[float]],
-        key: int,
+        mapping: OrderedDict[RateKey, deque[float]],
+        key: RateKey,
         now: float,
     ) -> deque[float]:
         events = mapping.setdefault(key, deque())
@@ -99,16 +100,22 @@ class GenerationQueue:
         chat_id: int,
         user_id: int,
         run: GenerationJob,
+        user_requests: int | None = None,
+        chat_requests: int | None = None,
     ) -> GenerationAdmission:
         async with self._lock:
             if not self._accepting:
                 return GenerationAdmission(False, "generation queue is not running")
             now = time.monotonic()
-            user_events = self._events_for_key(self._user_events, user_id, now)
+            user_limit = self.user_requests if user_requests is None else user_requests
+            chat_limit = self.chat_requests if chat_requests is None else chat_requests
+            user_events = self._events_for_key(
+                self._user_events, (chat_id, user_id), now
+            )
             chat_events = self._events_for_key(self._chat_events, chat_id, now)
-            if len(user_events) >= self.user_requests:
+            if len(user_events) >= user_limit:
                 return GenerationAdmission(False, "user rate limit reached")
-            if len(chat_events) >= self.chat_requests:
+            if len(chat_events) >= chat_limit:
                 return GenerationAdmission(False, "chat rate limit reached")
             if self._outstanding >= self._capacity:
                 return GenerationAdmission(False, "generation queue is full")

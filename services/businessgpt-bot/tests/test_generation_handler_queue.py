@@ -14,16 +14,24 @@ class FakeGenerationQueue:
         self.run = None
         self.submission = None
 
-    async def submit(self, *, chat_id, user_id, run):
+    async def submit(
+        self, *, chat_id, user_id, run, user_requests, chat_requests
+    ):
         self.run = run
-        self.submission = (chat_id, user_id)
+        self.submission = (chat_id, user_id, user_requests, chat_requests)
         return self.admission
 
 
 def make_context(queue: FakeGenerationQueue):
+    db = SimpleNamespace(
+        get_effective_admission_settings=lambda chat_id: {
+            "rate_limit_user_requests": 5,
+            "rate_limit_chat_requests": 20,
+        }
+    )
     bot_data = {
         "config": SimpleNamespace(allowed_chat_ids=frozenset({-100})),
-        "db": object(),
+        "db": db,
         "businessgpt": object(),
         "feedback_encryptor": object(),
         "context_cache": object(),
@@ -65,7 +73,7 @@ class GenerationHandlerQueueTests(unittest.IsolatedAsyncioTestCase):
             )
 
             generate.assert_not_awaited()
-            self.assertEqual(queue.submission, (-100, 42))
+            self.assertEqual(queue.submission, (-100, 42, 5, 20))
             reply_text.assert_awaited_once_with("generation queued: position 1")
 
             await queue.run()

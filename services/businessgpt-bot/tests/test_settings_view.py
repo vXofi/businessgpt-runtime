@@ -35,6 +35,12 @@ class SettingsViewTests(unittest.TestCase):
                 "s:n100:prompt_preview",
             )
             self.assertEqual(keyboard.inline_keyboard[0][1].text, "Model: default")
+            self.assertEqual(keyboard.inline_keyboard[4][0].text, "User/60s 3")
+            self.assertEqual(
+                keyboard.inline_keyboard[4][0].callback_data,
+                "s:n100:field:rate_limit_user_requests",
+            )
+            self.assertEqual(keyboard.inline_keyboard[4][1].text, "Chat/60s 10")
             db.close()
 
     def test_long_button_labels_are_bounded(self):

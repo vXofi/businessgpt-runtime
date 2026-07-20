@@ -9,7 +9,15 @@ import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable, Optional
 
-from .validation import normalize_api_url, validate_generation_settings, validate_generation_value
+from .validation import (
+    ADMISSION_RANGES,
+    GENERATION_RANGES,
+    normalize_api_url,
+    validate_admission_settings,
+    validate_admission_value,
+    validate_generation_settings,
+    validate_generation_value,
+)
 
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -27,13 +35,30 @@ def validate_name(name: str) -> str:
 
 
 class BotDB:
-    def __init__(self, path: str, *, default_recent_context_messages: int = 10) -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        default_recent_context_messages: int = 10,
+        default_rate_limit_user_requests: int = 3,
+        default_rate_limit_chat_requests: int = 10,
+    ) -> None:
         self.path = path
         self.default_recent_context_messages = int(
             validate_generation_value(
                 "recent_context_messages", default_recent_context_messages
             )
         )
+        admission_defaults = validate_admission_settings(
+            rate_limit_user_requests=default_rate_limit_user_requests,
+            rate_limit_chat_requests=default_rate_limit_chat_requests,
+        )
+        self.default_rate_limit_user_requests = admission_defaults[
+            "rate_limit_user_requests"
+        ]
+        self.default_rate_limit_chat_requests = admission_defaults[
+            "rate_limit_chat_requests"
+        ]
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -182,6 +207,12 @@ class BotDB:
             self._ensure_column("chat_settings", "top_p", "real")
             self._ensure_column("chat_settings", "top_k", "integer")
             self._ensure_column("chat_settings", "repetition_penalty", "real")
+            self._ensure_column(
+                "chat_settings", "rate_limit_user_requests", "integer"
+            )
+            self._ensure_column(
+                "chat_settings", "rate_limit_chat_requests", "integer"
+            )
             self._ensure_column("chat_settings", "active_prompt_v2_id", "integer")
             self._ensure_column("outbound_messages", "prompt_preset_v2_id", "integer")
             self._ensure_column("pending_admin_actions", "target_chat_id", "integer")
@@ -385,7 +416,12 @@ class BotDB:
             self._conn.commit()
 
     def set_chat_setting(self, chat_id: int, field: str, value: Any) -> None:
-        value = validate_generation_value(field, value)
+        if field in GENERATION_RANGES:
+            value = validate_generation_value(field, value)
+        elif field in ADMISSION_RANGES:
+            value = validate_admission_value(field, value)
+        else:
+            raise ValueError(f"unsupported chat setting: {field}")
         with self._lock:
             self._conn.execute(
                 f"insert into chat_settings(chat_id, {field}) values (?, ?) "
@@ -409,6 +445,21 @@ class BotDB:
                 else model["repetition_penalty"]
             ),
         })
+
+    def get_effective_admission_settings(self, chat_id: int) -> dict[str, int]:
+        chat = self.get_chat_settings(chat_id)
+        return validate_admission_settings(
+            rate_limit_user_requests=(
+                chat["rate_limit_user_requests"]
+                if chat["rate_limit_user_requests"] is not None
+                else self.default_rate_limit_user_requests
+            ),
+            rate_limit_chat_requests=(
+                chat["rate_limit_chat_requests"]
+                if chat["rate_limit_chat_requests"] is not None
+                else self.default_rate_limit_chat_requests
+            ),
+        )
 
     def get_active_prompt(self, chat_id: int) -> Optional[sqlite3.Row]:
         settings = self.get_chat_settings(chat_id)
