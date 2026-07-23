@@ -229,9 +229,9 @@ self-contained after the RAM cache expires.
 The bot handles ordinary Telegram updates concurrently while generation jobs
 run in a bounded in-memory FIFO queue. Generation defaults to one active job,
 eight waiting jobs, three accepted requests per user per minute, and ten per
-chat per minute. A queued user sees a temporary position message, which is
-deleted when their generation starts. Only a full queue or a rate limit rejects
-new work, so settings and reactions remain responsive behind a long model call.
+chat per minute. Queued requests wait silently until generation starts. Only a
+full queue or a rate limit rejects new work, so settings and reactions remain
+responsive behind a long model call.
 The two request counts are environment defaults and can be overridden per group
 through `/settings`; the time window, worker count, and queue size remain global
 infrastructure settings. The user limit is tracked independently in each group.

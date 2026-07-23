@@ -501,14 +501,8 @@ async def _generate_and_reply(
         return
     generation_queue: GenerationQueue = context.application.bot_data["generation_queue"]
     rate_limits = db.get_effective_admission_settings(target_chat_id)
-    setup_done = asyncio.Event()
-    queue_notice: Message | None = None
 
     async def run_generation() -> None:
-        await setup_done.wait()
-        if queue_notice is not None:
-            with suppress(asyncio.TimeoutError, TelegramError):
-                await asyncio.wait_for(queue_notice.delete(), timeout=5)
         try:
             await _generate_and_reply_inner(
                 update=update,
@@ -537,14 +531,6 @@ async def _generate_and_reply(
     )
     if not admission.allowed:
         await message.reply_text(f"generation unavailable: {admission.reason}")
-        return
-    try:
-        if admission.queued:
-            queue_notice = await message.reply_text(
-                f"generation queued: position {admission.position}"
-            )
-    finally:
-        setup_done.set()
 
 
 async def _generate_and_reply_inner(

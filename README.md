@@ -172,7 +172,7 @@ stickers remain silent. Generated `@` characters are stripped to avoid username
 notifications.
 
 Generation uses one model worker and a bounded FIFO queue by default. Concurrent
-requests receive a temporary queue position instead of a model-busy error;
+requests wait silently in the queue instead of receiving a model-busy error;
 `/status` shows active and queued job counts plus the effective request limits.
 
 Use these first:

@@ -54,9 +54,8 @@ def make_update(reply_text: AsyncMock):
 
 
 class GenerationHandlerQueueTests(unittest.IsolatedAsyncioTestCase):
-    async def test_queued_handler_returns_then_worker_runs_generation(self):
-        notice = SimpleNamespace(delete=AsyncMock())
-        reply_text = AsyncMock(return_value=notice)
+    async def test_queued_handler_is_silent_then_worker_runs_generation(self):
+        reply_text = AsyncMock()
         queue = FakeGenerationQueue(
             GenerationAdmission(True, queued=True, position=1)
         )
@@ -74,11 +73,10 @@ class GenerationHandlerQueueTests(unittest.IsolatedAsyncioTestCase):
 
             generate.assert_not_awaited()
             self.assertEqual(queue.submission, (-100, 42, 5, 20))
-            reply_text.assert_awaited_once_with("generation queued: position 1")
+            reply_text.assert_not_awaited()
 
             await queue.run()
 
-            notice.delete.assert_awaited_once()
             generate.assert_awaited_once()
 
     async def test_full_queue_reports_unavailable_without_running(self):
