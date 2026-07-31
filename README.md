@@ -46,7 +46,8 @@ scripts/                    builds, updates, migration, verification
 ## Local Verification
 
 ```bash
-python -m unittest discover -s services/businessgpt-api/tests -v
+PYTHONPATH=services/businessgpt-api \
+  python -m unittest discover -s services/businessgpt-api/tests -v
 PYTHONPATH=services/businessgpt-bot \
   python -m unittest discover -s services/businessgpt-bot/tests -v
 python -m unittest discover -s scripts/tests -v

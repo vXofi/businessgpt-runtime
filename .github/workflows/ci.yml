@@ -20,6 +20,8 @@ jobs:
           cache-dependency-path: services/businessgpt-api/requirements.lock
       - run: pip install -r services/businessgpt-api/requirements.lock
       - run: python -m unittest discover -s services/businessgpt-api/tests -v
+        env:
+          PYTHONPATH: services/businessgpt-api
 
   bot-tests:
     runs-on: ubuntu-latest
