@@ -25,14 +25,14 @@ api.example {
     }
 }
 
-bookkeeping.example {
-    reverse_proxy books:8080
+service-b.example {
+    reverse_proxy service-b:8080
 }
 """
         result = remove_site_block(source, "api.example")
         self.assertNotIn("api.example", result)
         self.assertIn("service-a.example", result)
-        self.assertIn("bookkeeping.example", result)
+        self.assertIn("service-b.example", result)
 
     def test_caddy_writer_preserves_bind_mount_inode(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -66,6 +66,7 @@ bookkeeping.example {
             api_values = {
                 "BUSINESSGPT_API_KEY": "api-secret",
                 "BUSINESSGPT_MODEL_PATH": "/models/model.gguf",
+                "BUSINESSGPT_SYSTEM_PROMPT": "private runtime prompt",
             }
             bot_values = {
                 "BUSINESSGPT_BOT_TOKEN": "bot-secret",
@@ -115,6 +116,46 @@ bookkeeping.example {
             self.assertEqual(migrated["BUSINESSGPT_BOT_GENERATION_QUEUE_SIZE"], "8")
             self.assertNotIn("api-secret", output.getvalue())
             self.assertNotIn("bot-secret", output.getvalue())
+
+    def test_env_migration_requires_a_private_runtime_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database = root / "bot.sqlite3"
+            connection = sqlite3.connect(database)
+            connection.execute("create table chat_settings(chat_id integer primary key)")
+            connection.execute("insert into chat_settings values (-100)")
+            connection.commit()
+            connection.close()
+
+            def fake_container_env(name):
+                if name == "businessgpt-api":
+                    return {"BUSINESSGPT_API_KEY": "api-secret"}
+                return {
+                    "BUSINESSGPT_BOT_TOKEN": "bot-secret",
+                    "BUSINESSGPT_BOT_ADMIN_USER_IDS": "123",
+                    "BUSINESSGPT_BOT_ALLOWED_CHAT_IDS": "-100",
+                    "BUSINESSGPT_API_KEY": "api-secret",
+                }
+
+            argv = [
+                "migrate_businessgpt_env_vm.py",
+                "--api-env",
+                str(root / "api.env"),
+                "--bot-env",
+                str(root / "bot.env"),
+                "--bot-db",
+                str(database),
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(
+                    migrate_businessgpt_env_vm,
+                    "container_env",
+                    side_effect=fake_container_env,
+                ),
+                self.assertRaisesRegex(SystemExit, "SYSTEM_PROMPT"),
+            ):
+                migrate_businessgpt_env_vm.main()
 
 
 if __name__ == "__main__":

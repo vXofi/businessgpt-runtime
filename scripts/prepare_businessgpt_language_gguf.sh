@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-SOURCE_MODEL="${SOURCE_MODEL:-/Users/developer/Documents/businessgpt/merged_model_v16_9b/model-Q5_K_M.gguf}"
+SOURCE_MODEL="${SOURCE_MODEL:?Set SOURCE_MODEL to the local source GGUF}"
 EXPECTED_SOURCE_SHA256="${EXPECTED_SOURCE_SHA256:-b92a2f414c7cd835a4c21db80d54f6cb996ab163e9b1acdc678cb1f6a02ba74b}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PWD/.artifacts/models}"
 OUTPUT_NAME="${OUTPUT_NAME:-model-Q5_K_M-no-mtp.gguf}"

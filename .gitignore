@@ -5,6 +5,22 @@ __pycache__/
 .env
 .env.*
 !.env.example
+.envrc
+
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.jsonl
+*.csv
+*.enc
+*.age
+*.pem
+*.key
+*.crt
+*.prompt
 
 *.gguf
 *.safetensors
@@ -18,6 +34,11 @@ adapters/
 *.tar
 *.tar.gz
 *.log
+benchmark-results/
+data/
+feedback/
+media-cache/
+prompts/private/
 
 secrets/
 tokens/

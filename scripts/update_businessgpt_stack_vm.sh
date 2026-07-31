@@ -4,7 +4,9 @@ set -euo pipefail
 api_dir="/opt/businessgpt"
 bot_dir="/opt/businessgpt-bot"
 xray_dir="/opt/businessgpt-xray"
-caddyfile="${BUSINESSGPT_CADDYFILE:-/etc/caddy/Caddyfile}"
+caddyfile="${BUSINESSGPT_CADDYFILE:?Set BUSINESSGPT_CADDYFILE}"
+caddy_container="${BUSINESSGPT_CADDY_CONTAINER:-caddy}"
+legacy_caddy_hostname="${BUSINESSGPT_LEGACY_CADDY_HOSTNAME:-}"
 stamp="$(date -u +%Y%m%d-%H%M%S)"
 state_root="$bot_dir/hardening-backups"
 state_dir="$state_root/hardening-$stamp"
@@ -85,8 +87,8 @@ rollback_stack() {
       >/dev/null 2>&1 || true
   fi
   cp -p "$state_dir/Caddyfile" "$caddyfile"
-  docker exec caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 \
-    && docker exec caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1
+  docker exec "$caddy_container" caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 \
+    && docker exec "$caddy_container" caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1
 
   docker start businessgpt-xray >/dev/null 2>&1 || true
   docker start businessgpt-api >/dev/null 2>&1 || true
@@ -155,9 +157,12 @@ if [[ "$bot_ready" != 1 ]]; then
   exit 1
 fi
 
-python3 "$api_dir/remove_caddy_site_vm.py" \
-  --caddyfile "$caddyfile" \
-  --hostname businessgpt-api.example.com
+if [[ -n "$legacy_caddy_hostname" ]]; then
+  python3 "$api_dir/remove_caddy_site_vm.py" \
+    --caddyfile "$caddyfile" \
+    --hostname "$legacy_caddy_hostname" \
+    --container "$caddy_container"
+fi
 
 for container in businessgpt-api businessgpt-bot businessgpt-xray; do
   if docker inspect "$container" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' | grep -qw edge; then

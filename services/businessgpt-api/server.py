@@ -100,8 +100,9 @@ if not API_KEY:
             "BUSINESSGPT_ALLOW_INSECURE_NO_AUTH=true and loopback HOST"
         )
 
-DEFAULT_SYSTEM_PROMPT = "Configure the system prompt at deployment time."
-SYSTEM_PROMPT = os.environ.get("BUSINESSGPT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
+SYSTEM_PROMPT = os.environ.get("BUSINESSGPT_SYSTEM_PROMPT", "").strip()
+if not SYSTEM_PROMPT:
+    raise RuntimeError("BUSINESSGPT_SYSTEM_PROMPT is required")
 
 
 @dataclass(frozen=True)

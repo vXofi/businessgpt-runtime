@@ -1,0 +1,18 @@
+title = "BusinessGPT public repository policy"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "businessgpt-populated-secret-env"
+description = "BusinessGPT secret assigned in an env-style line"
+regex = '''(?im)^(?:export[ \t]+)?BUSINESSGPT_(?:API_KEY|BOT_TOKEN)=[ \t]*([A-Za-z0-9][A-Za-z0-9_./+=:-]{7,})'''
+secretGroup = 1
+keywords = ["businessgpt_"]
+
+[[rules]]
+id = "businessgpt-populated-telegram-identity"
+description = "Telegram owner or chat IDs assigned in an env-style line"
+regex = '''(?im)^(?:export[ \t]+)?BUSINESSGPT_BOT_(?:OWNER_USER_IDS|ADMIN_USER_IDS|ALLOWED_CHAT_IDS)=[ \t]*(-?[0-9]{5,}(?:[ \t]*,[ \t]*-?[0-9]{5,})*)'''
+secretGroup = 1
+keywords = ["businessgpt_bot_"]

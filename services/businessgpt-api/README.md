@@ -12,7 +12,7 @@ route.
 | --- | --- | --- | --- |
 | `GET` | `/health` | none | Process liveness only |
 | `GET` | `/health/ready` | bearer | Backend/model readiness and hashes |
-| `GET` | `/prompt` | bearer | Exact compiled default prompt |
+| `GET` | `/prompt` | bearer | Exact configured default prompt |
 | `POST` | `/generate` | bearer | Text or vision generation |
 
 Protected routes require:
@@ -158,7 +158,7 @@ BUSINESSGPT_GENERATION_TIMEOUT_SECONDS=300
 BUSINESSGPT_HEALTH_TIMEOUT_SECONDS=2
 BUSINESSGPT_MAX_REQUEST_BODY_BYTES=16777216
 BUSINESSGPT_IMAGE_DECODE_CONCURRENCY=1
-BUSINESSGPT_SYSTEM_PROMPT=<optional default override>
+BUSINESSGPT_SYSTEM_PROMPT=<required private runtime prompt>
 ```
 
 ## Build And Deploy

@@ -1,8 +1,5 @@
-notes.example.com {
-    reverse_proxy service-a:5984
+# BusinessGPT intentionally has no public Caddy route.
+# Generic example for another service sharing the host:
+service.example.com {
+    reverse_proxy service:3000
 }
-
-# Future service example:
-# service1.example.com {
-#     reverse_proxy service1:3000
-# }

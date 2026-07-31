@@ -7,11 +7,11 @@ LLAMA_CPP_REF="${LLAMA_CPP_REF:-a4107133a634250c8c9d888bc0bc8520dcfd6105}"
 BASE_MODEL_ID="${BASE_MODEL_ID:-huihui-ai/Huihui-Qwen3.5-9B-abliterated}"
 BASE_MODEL_REVISION="${BASE_MODEL_REVISION:-05b9e7c9b978ba29bdb8f50a49c30e4b91183339}"
 LLAMA_CPP_DIR="${LLAMA_CPP_DIR:-$PWD/.cache/llama.cpp-$LLAMA_CPP_REF}"
-PYTHON_BIN="${PYTHON_BIN:-/Users/developer/Documents/businessgpt/.venv/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PWD/.artifacts/models}"
 OUTPUT_PATH="${OUTPUT_PATH:-$OUTPUT_DIR/mmproj-businessgpt-v16-f16.gguf}"
 
-if [[ ! -x "$PYTHON_BIN" ]]; then
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1 && [[ ! -x "$PYTHON_BIN" ]]; then
   echo "Python environment not found: $PYTHON_BIN" >&2
   exit 1
 fi

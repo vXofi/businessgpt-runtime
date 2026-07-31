@@ -13,6 +13,10 @@ grep -Eq '^BUSINESSGPT_API_KEY=.+$' "$env_file" || {
   echo "BUSINESSGPT_API_KEY is missing from $env_file" >&2
   exit 1
 }
+grep -Eq '^BUSINESSGPT_SYSTEM_PROMPT=.+$' "$env_file" || {
+  echo "BUSINESSGPT_SYSTEM_PROMPT is missing from $env_file" >&2
+  exit 1
+}
 
 env_value() {
   local name="$1"

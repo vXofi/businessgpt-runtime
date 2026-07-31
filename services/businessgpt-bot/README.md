@@ -275,11 +275,11 @@ the WAL, and warns when free disk space falls below 5 GiB.
 Create a consistent DB copy on the VM without stopping the bot:
 
 ```bash
-ssh -i ~/.ssh/businessgpt_ed25519 deploy@192.0.2.10 \
+ssh businessgpt \
   'docker exec businessgpt-bot python -c '\''import sqlite3; s=sqlite3.connect("/data/bot.sqlite3"); d=sqlite3.connect("/data/feedback-export.sqlite3"); s.backup(d); d.close(); s.close()'\'''
 
 scp -i ~/.ssh/businessgpt_ed25519 \
-  deploy@192.0.2.10:/opt/businessgpt-bot/data/feedback-export.sqlite3 \
+  businessgpt:/opt/businessgpt-bot/data/feedback-export.sqlite3 \
   ./bot.sqlite3
 ```
 

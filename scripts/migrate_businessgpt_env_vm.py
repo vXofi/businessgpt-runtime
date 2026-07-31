@@ -198,6 +198,9 @@ def main() -> int:
     api["BUSINESSGPT_API_KEY"] = api_key
     bot["BUSINESSGPT_API_KEY"] = api_key
 
+    if not api.get("BUSINESSGPT_SYSTEM_PROMPT"):
+        raise SystemExit("could not recover BUSINESSGPT_SYSTEM_PROMPT")
+
     write_private_env(args.api_env, api)
     write_private_env(args.bot_env, bot)
     print(f"wrote private API env: {args.api_env}")

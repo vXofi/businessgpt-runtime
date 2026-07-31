@@ -36,7 +36,7 @@ if __name__ == "__main__":
     print(
         ask_businessgpt(
             [
-                {"role": "user", "name": "example-user", "content": "сосал?"},
+                {"role": "user", "name": "example-user", "content": "Привет!"},
             ],
             max_tokens=64,
         )
