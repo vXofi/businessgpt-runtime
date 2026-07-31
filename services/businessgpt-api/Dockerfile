@@ -17,6 +17,12 @@ RUN git init /opt/llama.cpp \
         -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
     && cmake --build /opt/llama.cpp/build --target llama-server llama-quantize -j2
 
+FROM llama-builder AS runtime-libs
+
+RUN libgomp_path="$(gcc -print-file-name=libgomp.so.1)" \
+    && test -f "${libgomp_path}" \
+    && cp -L "${libgomp_path}" /tmp/libgomp.so.1
+
 FROM ${PYTHON_IMAGE}
 
 ARG LLAMA_CPP_REF=a4107133a634250c8c9d888bc0bc8520dcfd6105
@@ -27,14 +33,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HOST=0.0.0.0 \
     PORT=8000 \
     LLAMA_CPP_REF=${LLAMA_CPP_REF} \
-    LLAMA_SERVER_BIN=/usr/local/bin/llama-server
+    LLAMA_SERVER_BIN=/usr/local/bin/llama-server \
+    LD_LIBRARY_PATH=/usr/local/lib
 
 RUN groupadd --gid 10001 businessgpt \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin businessgpt
 
 COPY --from=llama-builder /opt/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
 COPY --from=llama-builder /opt/llama.cpp/build/bin/llama-quantize /usr/local/bin/llama-quantize
-COPY --from=llama-builder /usr/lib/x86_64-linux-gnu/libgomp.so.1* /usr/lib/x86_64-linux-gnu/
+COPY --from=runtime-libs /tmp/libgomp.so.1 /usr/local/lib/libgomp.so.1
 
 WORKDIR /app
 COPY requirements.lock ./requirements.lock
