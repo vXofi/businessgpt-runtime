@@ -4,7 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
-from .validation import normalize_api_url, validate_generation_settings
+from .image_generation_client import normalize_image_api_url
+from .validation import is_runpod_url, normalize_api_url, validate_generation_settings
 
 
 def _required_env(name: str) -> str:
@@ -38,6 +39,13 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name, "true" if default else "false").strip().lower()
+    if value not in {"true", "false"}:
+        raise RuntimeError(f"{name} must be true or false")
+    return value == "true"
+
+
 def _persistent_data_path(name: str, default: str) -> str:
     value = os.environ.get(name, default).strip()
     path = PurePosixPath(value)
@@ -55,6 +63,11 @@ class Config:
     telegram_proxy_url: str | None
     api_url: str
     api_key: str
+    image_generation_enabled: bool
+    image_api_url: str
+    image_api_key: str | None
+    image_generation_timeout_seconds: int
+    image_generation_queue_size: int
     db_path: str
     feedback_public_key_b64: str
     media_cache_dir: str
@@ -83,6 +96,9 @@ class Config:
     feedback_media_max_bytes: int
     maintenance_interval_seconds: int
     disk_free_warning_bytes: int
+    runpod_api_key: str | None = None
+    runpod_timeout_seconds: int = 600
+    runpod_proxy_url: str | None = None
 
     @property
     def admin_user_ids(self) -> frozenset[int]:
@@ -91,6 +107,9 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        image_generation_enabled = _bool_env(
+            "BUSINESSGPT_IMAGE_GENERATION_ENABLED", False
+        )
         api_url = normalize_api_url(
             os.environ.get(
                 "BUSINESSGPT_API_URL",
@@ -107,6 +126,14 @@ class Config:
         )
         if api_url not in allowed_api_urls:
             raise RuntimeError("BUSINESSGPT_API_URL must be in BUSINESSGPT_BOT_ALLOWED_API_URLS")
+        uses_runpod = any(is_runpod_url(url) for url in allowed_api_urls)
+        uses_direct = any(not is_runpod_url(url) for url in allowed_api_urls)
+        runpod_timeout = _positive_int("BUSINESSGPT_RUNPOD_TIMEOUT_SECONDS", 600)
+        if not 180 <= runpod_timeout <= 1800:
+            raise RuntimeError("BUSINESSGPT_RUNPOD_TIMEOUT_SECONDS must be between 180 and 1800")
+        image_max_bytes = _positive_int("BUSINESSGPT_BOT_IMAGE_MAX_BYTES", 10 * 1024 * 1024)
+        if uses_runpod:
+            image_max_bytes = min(image_max_bytes, 6 * 1024 * 1024)
         owner_values = os.environ.get("BUSINESSGPT_BOT_OWNER_USER_IDS", "").strip()
         if not owner_values:
             owner_values = _required_env("BUSINESSGPT_BOT_ADMIN_USER_IDS")
@@ -137,7 +164,33 @@ class Config:
                 os.environ.get("BUSINESSGPT_BOT_TELEGRAM_PROXY_URL", "").strip() or None
             ),
             api_url=api_url,
-            api_key=_required_env("BUSINESSGPT_API_KEY"),
+            api_key=_required_env("BUSINESSGPT_API_KEY") if uses_direct else "",
+            runpod_api_key=_required_env("BUSINESSGPT_RUNPOD_API_KEY") if uses_runpod else None,
+            runpod_timeout_seconds=runpod_timeout,
+            runpod_proxy_url=(
+                os.environ.get(
+                    "BUSINESSGPT_RUNPOD_PROXY_URL",
+                    os.environ.get("BUSINESSGPT_BOT_TELEGRAM_PROXY_URL", ""),
+                ).strip() or None
+            ),
+            image_generation_enabled=image_generation_enabled,
+            image_api_url=normalize_image_api_url(
+                os.environ.get(
+                    "BUSINESSGPT_IMAGE_API_URL",
+                    "https://anogram.ru/v1/images/generations/stream",
+                )
+            ),
+            image_api_key=(
+                _required_env("BUSINESSGPT_IMAGE_API_KEY")
+                if image_generation_enabled
+                else None
+            ),
+            image_generation_timeout_seconds=_positive_int(
+                "BUSINESSGPT_BOT_IMAGE_GENERATION_TIMEOUT_SECONDS", 120
+            ),
+            image_generation_queue_size=_positive_int(
+                "BUSINESSGPT_BOT_IMAGE_GENERATION_QUEUE_SIZE", 4
+            ),
             db_path=_persistent_data_path(
                 "BUSINESSGPT_BOT_DB_PATH", "/data/bot.sqlite3"
             ),
@@ -151,9 +204,7 @@ class Config:
             media_cache_max_bytes=_positive_int(
                 "BUSINESSGPT_BOT_MEDIA_CACHE_MAX_BYTES", 256 * 1024 * 1024
             ),
-            image_max_bytes=_positive_int(
-                "BUSINESSGPT_BOT_IMAGE_MAX_BYTES", 10 * 1024 * 1024
-            ),
+            image_max_bytes=image_max_bytes,
             default_max_tokens=int(defaults["max_tokens"]),
             default_temperature=float(defaults["temperature"]),
             default_top_p=float(defaults["top_p"]),

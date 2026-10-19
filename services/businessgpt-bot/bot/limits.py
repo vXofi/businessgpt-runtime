@@ -40,6 +40,7 @@ class GenerationQueue:
         chat_requests: int,
         window_seconds: int,
         max_keys: int = 512,
+        task_name_prefix: str = "businessgpt-generation",
     ) -> None:
         self.max_concurrent = max_concurrent
         self.max_queue_size = max_queue_size
@@ -47,6 +48,7 @@ class GenerationQueue:
         self.chat_requests = chat_requests
         self.window_seconds = window_seconds
         self.max_keys = max_keys
+        self.task_name_prefix = task_name_prefix
         self._capacity = max_concurrent + max_queue_size
         self._queue: asyncio.Queue[_QueuedGeneration] = asyncio.Queue(
             maxsize=self._capacity
@@ -74,7 +76,7 @@ class GenerationQueue:
         self._workers = [
             asyncio.create_task(
                 self._worker(),
-                name=f"businessgpt-generation-{index + 1}",
+                name=f"{self.task_name_prefix}-{index + 1}",
             )
             for index in range(self.max_concurrent)
         ]

@@ -16,6 +16,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 
 from api_security import SecurityLimitsMiddleware
+from backend_provenance import extract_backend_provenance
 from context_window import ContextBudgetError, PromptMessage, fit_messages_to_context
 from media import ImageValidationError, NormalizedImage, normalize_image_data_url
 from model_verification import verify_model_files
@@ -36,6 +37,8 @@ IMAGE_MAX_TOKENS = int(os.environ.get("BUSINESSGPT_IMAGE_MAX_TOKENS", "1024"))
 N_THREADS = int(os.environ.get("BUSINESSGPT_N_THREADS", str(os.cpu_count() or 4)))
 N_GPU_LAYERS = int(os.environ.get("BUSINESSGPT_N_GPU_LAYERS", "0"))
 N_PARALLEL = int(os.environ.get("BUSINESSGPT_N_PARALLEL", "1"))
+CACHE_RAM_MIB = int(os.environ.get("BUSINESSGPT_CACHE_RAM_MIB", "0"))
+CTX_CHECKPOINTS = int(os.environ.get("BUSINESSGPT_CTX_CHECKPOINTS", "1"))
 STARTUP_TIMEOUT_SECONDS = int(os.environ.get("BUSINESSGPT_STARTUP_TIMEOUT_SECONDS", "900"))
 TOKENIZE_TIMEOUT_SECONDS = float(
     os.environ.get("BUSINESSGPT_TOKENIZE_TIMEOUT_SECONDS", "30")
@@ -84,6 +87,10 @@ if IMAGE_MAX_TOKENS <= 0 or IMAGE_MAX_TOKENS >= N_CTX:
     raise RuntimeError("BUSINESSGPT_IMAGE_MAX_TOKENS must be between 1 and N_CTX - 1")
 if N_PARALLEL <= 0:
     raise RuntimeError("BUSINESSGPT_N_PARALLEL must be positive")
+if CACHE_RAM_MIB < 0:
+    raise RuntimeError("BUSINESSGPT_CACHE_RAM_MIB must be non-negative")
+if CTX_CHECKPOINTS < 0:
+    raise RuntimeError("BUSINESSGPT_CTX_CHECKPOINTS must be non-negative")
 if STARTUP_TIMEOUT_SECONDS <= 0:
     raise RuntimeError("BUSINESSGPT_STARTUP_TIMEOUT_SECONDS must be positive")
 if min(TOKENIZE_TIMEOUT_SECONDS, GENERATION_TIMEOUT_SECONDS, HEALTH_TIMEOUT_SECONDS) <= 0:
@@ -283,6 +290,10 @@ def _start_llama_server() -> subprocess.Popen:
         str(N_GPU_LAYERS),
         "--parallel",
         str(N_PARALLEL),
+        "--cache-ram",
+        str(CACHE_RAM_MIB),
+        "--ctx-checkpoints",
+        str(CTX_CHECKPOINTS),
         "--host",
         LLAMA_HOST,
         "--port",
@@ -346,7 +357,7 @@ if MMPROJ_PATH and not startup_props.get("modalities", {}).get("vision", False):
 
 app = FastAPI(
     title="BusinessGPT API",
-    version="0.6.0",
+    version="0.7.1",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -374,6 +385,8 @@ def readiness() -> dict:
     return {
         "ok": True,
         "vision_enabled": bool(modalities.get("vision", False)),
+        "cache_ram_mib": CACHE_RAM_MIB,
+        "ctx_checkpoints": CTX_CHECKPOINTS,
         "model_sha256": verified_model_sha256,
         "projector_sha256": verified_projector_sha256,
     }
@@ -439,6 +452,8 @@ def generate(req: GenerateRequest) -> GenerateResponse:
         "stream": False,
         "reasoning_format": "none",
     }
+    if req.seed is not None:
+        payload["seed"] = req.seed
     try:
         result = client.post(
             "/v1/chat/completions",
@@ -453,6 +468,10 @@ def generate(req: GenerateRequest) -> GenerateResponse:
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     backend_usage = data.get("usage") or {}
+    backend_provenance = extract_backend_provenance(
+        data,
+        requested_seed=req.seed,
+    )
     image = images[0] if images else None
     return GenerateResponse(
         response=_clean_response(str(response_text or "")),
@@ -472,6 +491,8 @@ def generate(req: GenerateRequest) -> GenerateResponse:
             ],
             "prepared_prompt_tokens": context_fit.prompt_tokens,
             "context_limit_tokens": N_CTX,
+            "cache_ram_mib": CACHE_RAM_MIB,
+            "ctx_checkpoints": CTX_CHECKPOINTS,
             "prompt_budget_tokens": prompt_budget_tokens,
             "image_count": len(images),
             "image_reserved_tokens": image_reserve_tokens,
@@ -480,5 +501,6 @@ def generate(req: GenerateRequest) -> GenerateResponse:
             "input_truncated": context_fit.input_truncated,
             "dropped_messages": context_fit.dropped_messages,
             "truncated_characters": context_fit.truncated_characters,
+            **backend_provenance,
         },
     )

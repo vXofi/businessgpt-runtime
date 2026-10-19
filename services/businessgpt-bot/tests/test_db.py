@@ -155,6 +155,76 @@ class BotDBTest(unittest.TestCase):
             )
             db.close()
 
+    def test_image_generation_settings_have_defaults_and_persist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = BotDB(str(Path(tmp) / "bot.sqlite3"))
+            db.migrate()
+
+            self.assertEqual(
+                db.get_image_generation_settings(-100),
+                {
+                    "enabled": True,
+                    "width": 512,
+                    "height": 512,
+                    "steps": 4,
+                    "guidance_scale": 1.0,
+                    "auto_translate": True,
+                },
+            )
+            db.set_chat_setting(-100, "image_generation_enabled", 0)
+            db.set_chat_setting(-100, "image_width", 384)
+            db.set_chat_setting(-100, "image_height", 448)
+            db.set_chat_setting(-100, "image_steps", 6)
+            db.set_chat_setting(-100, "image_guidance_scale", 1.5)
+            db.set_chat_setting(-100, "image_auto_translate", 0)
+
+            self.assertEqual(
+                db.get_image_generation_settings(-100),
+                {
+                    "enabled": False,
+                    "width": 384,
+                    "height": 448,
+                    "steps": 6,
+                    "guidance_scale": 1.5,
+                    "auto_translate": False,
+                },
+            )
+            db.close()
+
+    def test_image_generation_settings_update_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = BotDB(str(Path(tmp) / "bot.sqlite3"))
+            db.migrate()
+
+            db.set_image_generation_settings(
+                -100,
+                image_width=512,
+                image_height=512,
+                image_steps=16,
+                image_guidance_scale=5.0,
+                image_auto_translate=True,
+            )
+            self.assertEqual(
+                db.get_image_generation_settings(-100),
+                {
+                    "enabled": True,
+                    "width": 512,
+                    "height": 512,
+                    "steps": 16,
+                    "guidance_scale": 5.0,
+                    "auto_translate": True,
+                },
+            )
+
+            with self.assertRaises(ValueError):
+                db.set_image_generation_settings(
+                    -100,
+                    image_width=256,
+                    image_steps=17,
+                )
+            self.assertEqual(db.get_image_generation_settings(-100)["width"], 512)
+            db.close()
+
     def test_migrates_existing_schema_without_data_loss(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "bot.sqlite3"
@@ -187,6 +257,8 @@ class BotDBTest(unittest.TestCase):
             self.assertIn("top_k", settings.keys())
             self.assertIn("rate_limit_user_requests", settings.keys())
             self.assertIn("rate_limit_chat_requests", settings.keys())
+            self.assertEqual(db.get_image_generation_settings(99)["width"], 512)
+            self.assertTrue(db.get_image_generation_settings(99)["enabled"])
             db.close()
 
     def test_pending_actions_expire_without_being_popped_early(self):

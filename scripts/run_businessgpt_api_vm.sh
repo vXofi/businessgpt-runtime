@@ -28,6 +28,16 @@ env_value() {
 
 model_path="$(env_value BUSINESSGPT_MODEL_PATH /models/model-Q5_K_M-no-mtp.gguf)"
 mmproj_path="$(env_value BUSINESSGPT_MMPROJ_PATH '')"
+cache_ram_mib="$(env_value BUSINESSGPT_CACHE_RAM_MIB 0)"
+[[ "$cache_ram_mib" =~ ^[0-9]+$ ]] || {
+  echo "BUSINESSGPT_CACHE_RAM_MIB must be a non-negative integer" >&2
+  exit 1
+}
+ctx_checkpoints="$(env_value BUSINESSGPT_CTX_CHECKPOINTS 1)"
+[[ "$ctx_checkpoints" =~ ^[0-9]+$ ]] || {
+  echo "BUSINESSGPT_CTX_CHECKPOINTS must be a non-negative integer" >&2
+  exit 1
+}
 host_model="/opt/businessgpt/models/${model_path##*/}"
 [[ -f "$host_model" ]] || { echo "Missing model: $host_model" >&2; exit 1; }
 if [[ -n "$mmproj_path" ]]; then
@@ -44,6 +54,8 @@ health_cmd='python -c '\''import json,urllib.request; assert json.load(urllib.re
 docker create --name businessgpt-api --restart unless-stopped \
   --network "$network" \
   --env-file "$env_file" \
+  --env "LLAMA_ARG_CACHE_RAM=$cache_ram_mib" \
+  --env "LLAMA_ARG_CTX_CHECKPOINTS=$ctx_checkpoints" \
   --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=64m \
   --cap-drop ALL \

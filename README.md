@@ -9,7 +9,7 @@ deployment tooling.
 ```text
 Telegram
    -> allowlisted bot, bounded context, rate limits, FIFO queue
-   -> private FastAPI service
+   -> private FastAPI service or allowlisted Runpod queue endpoint
    -> pinned llama.cpp + hash-verified GGUF/projector
    -> encrypted reaction feedback with request/model provenance
 ```
@@ -27,10 +27,14 @@ host addresses are deployment configuration and are not stored in Git.
 - bounded FIFO generation queue and per-user/per-chat request limits;
 - encrypted reaction samples with bounded retention;
 - non-root, read-only containers on isolated Docker networks;
-- text, image, and Telegram sticker inputs;
+- text, image, sticker, and video/animation preview inputs;
+- optional Runpod transport with bounded waiting and cancellation;
+- optional image generation, server-side disable policy, and spoiler delivery;
+- polling/update tracing and structured startup readiness;
 - generic Caddy migration and Xray egress tooling.
 
 See [Architecture](docs/ARCHITECTURE.md),
+[Runtime Updates](docs/RUNTIME_UPDATES.md),
 [Engineering Evidence](docs/EVIDENCE.md), and [Security](SECURITY.md).
 
 ## Repository Layout
@@ -71,8 +75,9 @@ BUSINESSGPT_BOT_ALLOWED_CHAT_IDS
 ```
 
 The API fails closed without its key or configured system prompt. The bot fails
-closed without its token, owner IDs, allowed group IDs, API key, and exact API
-URL allowlist.
+closed without its token, owner IDs, allowed group IDs, exact API URL allowlist,
+and the key required by the selected transport. Runpod-only profiles use a
+separate `BUSINESSGPT_RUNPOD_API_KEY` instead of the direct API key.
 
 Deployment entry points require an explicit target:
 
@@ -89,8 +94,9 @@ They are not usable production defaults.
 
 The deployed model described by this baseline is the v16 SFT artifact. A
 RuBERT reward model has been trained, but it is not integrated into the
-production inference path. Best-of-N and Q4/Q5 benchmarking are not represented
-as completed runtime capabilities.
+production inference path. The runtime includes Q4/Q5 manifest verification,
+GPU benchmark tooling and an optional Runpod worker. No quality improvement or
+GPU availability is implied by those capabilities. Best-of-N is not integrated.
 
 The model manifest pins the expected language model, vision projector,
 llama.cpp revision, filenames, sizes, and SHA-256 values. Model binaries are

@@ -47,7 +47,7 @@ WORKDIR /app
 COPY requirements.lock ./requirements.lock
 RUN pip install --no-cache-dir -r requirements.lock
 
-COPY server.py context_window.py media.py api_security.py request_models.py model_verification.py ./
+COPY server.py context_window.py media.py api_security.py request_models.py model_verification.py backend_provenance.py ./
 COPY model-manifest.json ./model-manifest.json
 
 USER 10001:10001

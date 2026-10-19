@@ -1,22 +1,38 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "runtime": {
     "implementation": "native llama.cpp llama-server",
     "llama_cpp_revision": "a4107133a634250c8c9d888bc0bc8520dcfd6105",
     "llama_cpp_python": false
   },
-  "language_model": {
-    "adapter_repo": "vXofi/businessgpt-v16-qwen3.5-9b",
-    "adapter_revision": "53bb68c8e45610ed31d6fbbfc3e713ca9472444d",
-    "base_repo": "huihui-ai/Huihui-Qwen3.5-9B-abliterated",
-    "base_revision": "05b9e7c9b978ba29bdb8f50a49c30e4b91183339",
-    "source_q5_filename": "model-Q5_K_M.gguf",
-    "source_q5_sha256": "b92a2f414c7cd835a4c21db80d54f6cb996ab163e9b1acdc678cb1f6a02ba74b",
-    "production_filename": "model-Q5_K_M-no-mtp.gguf",
-    "production_size_bytes": 6467961824,
-    "production_sha256": "86c03187f52d4e2761ae861721cf65b46df3d652e60cd60823374ec9cc250fa7",
-    "metadata_correction": "Lossless GGUF COPY with qwen35.block_count=32 and qwen35.nextn_predict_layers=0; the merged checkpoint contains no MTP tensors."
-  },
+  "language_models": [
+    {
+      "quant": "Q5_K_M",
+      "adapter_repo": "vXofi/businessgpt-v16-qwen3.5-9b",
+      "adapter_revision": "53bb68c8e45610ed31d6fbbfc3e713ca9472444d",
+      "base_repo": "huihui-ai/Huihui-Qwen3.5-9B-abliterated",
+      "base_revision": "05b9e7c9b978ba29bdb8f50a49c30e4b91183339",
+      "source_filename": "model-Q5_K_M.gguf",
+      "source_sha256": "b92a2f414c7cd835a4c21db80d54f6cb996ab163e9b1acdc678cb1f6a02ba74b",
+      "production_filename": "model-Q5_K_M-no-mtp.gguf",
+      "production_size_bytes": 6467961824,
+      "production_sha256": "86c03187f52d4e2761ae861721cf65b46df3d652e60cd60823374ec9cc250fa7",
+      "metadata_correction": "Lossless GGUF COPY with qwen35.block_count=32 and qwen35.nextn_predict_layers=0; the merged checkpoint contains no MTP tensors."
+    },
+    {
+      "quant": "Q4_K_M",
+      "adapter_repo": "vXofi/businessgpt-v16-qwen3.5-9b",
+      "adapter_revision": "53bb68c8e45610ed31d6fbbfc3e713ca9472444d",
+      "base_repo": "huihui-ai/Huihui-Qwen3.5-9B-abliterated",
+      "base_revision": "05b9e7c9b978ba29bdb8f50a49c30e4b91183339",
+      "source_filename": "model-Q4_K_M.gguf",
+      "source_sha256": "2cfa9995a830a7f515cd090e066c53a6163094fdb6280d93d272290c6e9b9170",
+      "production_filename": "model-Q4_K_M-no-mtp.gguf",
+      "production_size_bytes": 5629101024,
+      "production_sha256": "692e7314681fc1a06ca2d68c93fbc76cf980c1bc07ad229a09aa067d9496e751",
+      "metadata_correction": "Lossless GGUF COPY with qwen35.block_count=32 and qwen35.nextn_predict_layers=0; the merged checkpoint contains no MTP tensors."
+    }
+  ],
   "vision_projector": {
     "source_repo": "huihui-ai/Huihui-Qwen3.5-9B-abliterated",
     "source_revision": "05b9e7c9b978ba29bdb8f50a49c30e4b91183339",

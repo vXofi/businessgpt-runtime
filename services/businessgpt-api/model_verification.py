@@ -34,14 +34,18 @@ def verify_model_files(
         raise ModelVerificationError(f"could not read model manifest: {exc}") from exc
 
     try:
+        language_models = manifest.get("language_models")
+        if language_models is None:
+            language_models = [manifest["language_model"]]
+        if not isinstance(language_models, list) or not language_models:
+            raise TypeError
         expected = {
-            manifest["language_model"]["production_filename"]: manifest[
-                "language_model"
-            ]["production_sha256"],
-            manifest["vision_projector"]["production_filename"]: manifest[
-                "vision_projector"
-            ]["sha256"],
+            item["production_filename"]: item["production_sha256"]
+            for item in language_models
         }
+        expected[manifest["vision_projector"]["production_filename"]] = manifest[
+            "vision_projector"
+        ]["sha256"]
     except (KeyError, TypeError) as exc:
         raise ModelVerificationError("model manifest has an invalid structure") from exc
 

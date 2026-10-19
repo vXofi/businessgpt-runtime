@@ -107,6 +107,9 @@ service-b.example {
                 self.assertEqual(migrate_businessgpt_env_vm.main(), 0)
 
             migrated = read_env_file(root / "bot.env")
+            migrated_api = read_env_file(root / "api.env")
+            self.assertEqual(migrated_api["BUSINESSGPT_CACHE_RAM_MIB"], "0")
+            self.assertEqual(migrated_api["BUSINESSGPT_CTX_CHECKPOINTS"], "1")
             self.assertEqual(migrated["BUSINESSGPT_BOT_ALLOWED_CHAT_IDS"], "-200,-100")
             self.assertEqual(
                 migrated["BUSINESSGPT_BOT_ALLOWED_API_URLS"],
