@@ -1,0 +1,82 @@
+ARG CUDA_DEVEL_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.8.1-runtime-ubuntu24.04@sha256:ebef3c171eeef0298e4eb2e4be843105edf3b8b0ac45e0b43acee358e8046867
+FROM ${CUDA_DEVEL_IMAGE} AS llama-builder
+
+ARG LLAMA_CPP_REF=a4107133a634250c8c9d888bc0bc8520dcfd6105
+ARG CUDA_ARCHITECTURES=86;89
+ARG BUILD_JOBS=2
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates cmake git \
+    && rm -rf /var/lib/apt/lists/*
+RUN git init /opt/llama.cpp \
+    && git -C /opt/llama.cpp remote add origin https://github.com/ggml-org/llama.cpp \
+    && git -C /opt/llama.cpp fetch --depth 1 origin "${LLAMA_CPP_REF}" \
+    && git -C /opt/llama.cpp checkout --detach FETCH_HEAD \
+    && cmake -B /opt/llama.cpp/build -S /opt/llama.cpp \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DGGML_NATIVE=OFF -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
+        -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
+    && cmake --build /opt/llama.cpp/build --target llama-server -j"${BUILD_JOBS}"
+
+FROM ${CUDA_RUNTIME_IMAGE} AS runtime
+ARG LLAMA_CPP_REF=a4107133a634250c8c9d888bc0bc8520dcfd6105
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/tmp \
+    PATH=/opt/venv/bin:$PATH \
+    HOST=0.0.0.0 \
+    PORT=8000 \
+    LLAMA_CPP_REF=${LLAMA_CPP_REF} \
+    LLAMA_SERVER_BIN=/usr/local/bin/llama-server \
+    BUSINESSGPT_N_GPU_LAYERS=99 \
+    BUSINESSGPT_N_CTX=4096 \
+    BUSINESSGPT_N_PARALLEL=1 \
+    BUSINESSGPT_CACHE_RAM_MIB=0 \
+    BUSINESSGPT_CTX_CHECKPOINTS=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-venv libgomp1 ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /opt/venv \
+    && groupadd --gid 10001 businessgpt \
+    && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin businessgpt
+COPY --from=llama-builder /opt/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
+WORKDIR /app
+COPY requirements.lock ./requirements.lock
+RUN pip install --no-cache-dir -r requirements.lock
+COPY server.py context_window.py media.py api_security.py request_models.py model_verification.py backend_provenance.py ./
+COPY model-manifest.json ./model-manifest.json
+USER 10001:10001
+ENTRYPOINT []
+CMD ["sh", "-c", "exec python -m uvicorn server:app --host \"$HOST\" --port \"$PORT\" --workers 1 --no-server-header --timeout-keep-alive 5 --h11-max-incomplete-event-size 16384"]
+
+FROM runtime AS benchmark
+# The helper supplies a dedicated named context containing model artifacts only.
+COPY --from=model_artifacts /model-Q5_K_M-no-mtp.gguf /models/model-Q5_K_M-no-mtp.gguf
+COPY --from=model_artifacts /mmproj-businessgpt-v16-f16.gguf /models/mmproj-businessgpt-v16-f16.gguf
+COPY benchmark_gpu.py ./benchmark_gpu.py
+ENV BUSINESSGPT_MODEL_PATH=/models/model-Q5_K_M-no-mtp.gguf \
+    BUSINESSGPT_MMPROJ_PATH=/models/mmproj-businessgpt-v16-f16.gguf
+# Keep the Pod idle after completion so its supervisor cannot repeat the test.
+# GPU rental continues until the operator stops the Pod in Runpod.
+CMD ["sh", "-c", "python /app/benchmark_gpu.py --output /tmp/businessgpt-gpu-benchmark.json; printf '\nBenchmark finished. STOP THIS POD in Runpod to end GPU billing.\n'; exec sleep infinity"]
+
+FROM benchmark AS serverless
+USER 0:0
+COPY requirements-runpod.lock ./requirements-runpod.lock
+# The SDK's newer FastAPI requirements must not change the benchmarked API.
+RUN /opt/venv/bin/python -m venv /opt/runpod-venv \
+    && /opt/runpod-venv/bin/pip install --no-cache-dir -r requirements-runpod.lock \
+    && /opt/runpod-venv/bin/pip check \
+    && /opt/venv/bin/pip check
+COPY runpod_worker.py ./runpod_worker.py
+ENV BUSINESSGPT_API_PYTHON=/opt/venv/bin/python \
+    BUSINESSGPT_N_THREADS=4 \
+    HOST=127.0.0.1 \
+    LLAMA_HOST=127.0.0.1
+USER 10001:10001
+CMD ["/opt/runpod-venv/bin/python", "/app/runpod_worker.py", "--rp_log_level", "WARN"]

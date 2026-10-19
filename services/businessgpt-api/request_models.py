@@ -57,6 +57,7 @@ class GenerateRequest(BaseModel):
     top_p: float = Field(0.9, ge=0.0, le=1.0, allow_inf_nan=False)
     top_k: int = Field(50, ge=0, le=200)
     repetition_penalty: float = Field(1.1, ge=0.0, le=3.0, allow_inf_nan=False)
+    seed: Optional[int] = Field(None, ge=0, le=2_147_483_647)
 
     @model_validator(mode="after")
     def validate_aggregate_limits(self) -> "GenerateRequest":

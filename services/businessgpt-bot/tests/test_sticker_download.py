@@ -30,7 +30,13 @@ def make_sticker(
 
 
 def make_message(sticker):
-    return SimpleNamespace(photo=[], document=None, sticker=sticker)
+    return SimpleNamespace(
+        photo=[],
+        document=None,
+        sticker=sticker,
+        video=None,
+        animation=None,
+    )
 
 
 def make_context(data: bytes, *, image_max_bytes: int = 10 * 1024 * 1024):

@@ -11,12 +11,16 @@ from typing import Any, Iterable, Optional
 
 from .validation import (
     ADMISSION_RANGES,
+    BOOLEAN_IMAGE_GENERATION_FIELDS,
     GENERATION_RANGES,
+    IMAGE_GENERATION_RANGES,
     normalize_api_url,
     validate_admission_settings,
     validate_admission_value,
     validate_generation_settings,
     validate_generation_value,
+    validate_image_generation_settings,
+    validate_image_generation_value,
 )
 
 
@@ -212,6 +216,24 @@ class BotDB:
             )
             self._ensure_column(
                 "chat_settings", "rate_limit_chat_requests", "integer"
+            )
+            self._ensure_column(
+                "chat_settings", "image_generation_enabled", "integer not null default 1"
+            )
+            self._ensure_column(
+                "chat_settings", "image_width", "integer not null default 512"
+            )
+            self._ensure_column(
+                "chat_settings", "image_height", "integer not null default 512"
+            )
+            self._ensure_column(
+                "chat_settings", "image_steps", "integer not null default 4"
+            )
+            self._ensure_column(
+                "chat_settings", "image_guidance_scale", "real not null default 1.0"
+            )
+            self._ensure_column(
+                "chat_settings", "image_auto_translate", "integer not null default 1"
             )
             self._ensure_column("chat_settings", "active_prompt_v2_id", "integer")
             self._ensure_column("outbound_messages", "prompt_preset_v2_id", "integer")
@@ -420,6 +442,8 @@ class BotDB:
             value = validate_generation_value(field, value)
         elif field in ADMISSION_RANGES:
             value = validate_admission_value(field, value)
+        elif field in IMAGE_GENERATION_RANGES or field in BOOLEAN_IMAGE_GENERATION_FIELDS:
+            value = validate_image_generation_value(field, value)
         else:
             raise ValueError(f"unsupported chat setting: {field}")
         with self._lock:
@@ -427,6 +451,35 @@ class BotDB:
                 f"insert into chat_settings(chat_id, {field}) values (?, ?) "
                 f"on conflict(chat_id) do update set {field} = excluded.{field}",
                 (chat_id, value),
+            )
+            self._conn.commit()
+
+    def set_image_generation_settings(
+        self, chat_id: int, **settings: Any
+    ) -> None:
+        allowed_fields = set(IMAGE_GENERATION_RANGES) | set(
+            BOOLEAN_IMAGE_GENERATION_FIELDS
+        )
+        if not settings:
+            raise ValueError("at least one image generation setting is required")
+        unsupported = set(settings) - allowed_fields
+        if unsupported:
+            raise ValueError(
+                f"unsupported image generation setting: {sorted(unsupported)[0]}"
+            )
+        values = validate_image_generation_settings(**settings)
+        fields = list(values)
+        columns = ", ".join(fields)
+        placeholders = ", ".join("?" for _ in fields)
+        assignments = ", ".join(
+            f"{field} = excluded.{field}" for field in fields
+        )
+        with self._lock:
+            self._conn.execute(
+                f"insert into chat_settings(chat_id, {columns}) "
+                f"values (?, {placeholders}) "
+                f"on conflict(chat_id) do update set {assignments}",
+                (chat_id, *(values[field] for field in fields)),
             )
             self._conn.commit()
 
@@ -460,6 +513,25 @@ class BotDB:
                 else self.default_rate_limit_chat_requests
             ),
         )
+
+    def get_image_generation_settings(self, chat_id: int) -> dict[str, Any]:
+        chat = self.get_chat_settings(chat_id)
+        values = validate_image_generation_settings(
+            image_generation_enabled=chat["image_generation_enabled"],
+            image_width=chat["image_width"],
+            image_height=chat["image_height"],
+            image_steps=chat["image_steps"],
+            image_guidance_scale=chat["image_guidance_scale"],
+            image_auto_translate=chat["image_auto_translate"],
+        )
+        return {
+            "enabled": bool(values["image_generation_enabled"]),
+            "width": int(values["image_width"]),
+            "height": int(values["image_height"]),
+            "steps": int(values["image_steps"]),
+            "guidance_scale": float(values["image_guidance_scale"]),
+            "auto_translate": bool(values["image_auto_translate"]),
+        }
 
     def get_active_prompt(self, chat_id: int) -> Optional[sqlite3.Row]:
         settings = self.get_chat_settings(chat_id)

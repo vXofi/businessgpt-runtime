@@ -64,6 +64,43 @@ class ModelVerificationTests(unittest.TestCase):
                     allow_unverified=False,
                 )
 
+    def test_verifies_one_of_multiple_language_models(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / "model-Q4.gguf"
+            projector = root / "projector.gguf"
+            model.write_bytes(b"q4")
+            projector.write_bytes(b"projector")
+            manifest = root / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "language_models": [
+                            {
+                                "production_filename": "model-Q5.gguf",
+                                "production_sha256": hashlib.sha256(b"q5").hexdigest(),
+                            },
+                            {
+                                "production_filename": model.name,
+                                "production_sha256": hashlib.sha256(b"q4").hexdigest(),
+                            },
+                        ],
+                        "vision_projector": {
+                            "production_filename": projector.name,
+                            "sha256": hashlib.sha256(b"projector").hexdigest(),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hashes = verify_model_files(
+                manifest_path=str(manifest),
+                model_path=str(model),
+                projector_path=str(projector),
+                allow_unverified=False,
+            )
+            self.assertEqual(hashes[0], hashlib.sha256(b"q4").hexdigest())
+
 
 if __name__ == "__main__":
     unittest.main()

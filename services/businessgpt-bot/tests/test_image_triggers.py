@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from bot.handlers import (
     _image_source,
     _media_message_is_trigger,
+    _text_message_trigger_reasons,
     _text_message_is_trigger,
 )
 
@@ -22,6 +23,8 @@ def make_message(
     caption=None,
     photo=False,
     sticker=False,
+    video=False,
+    animation=False,
     reply_to=None,
     from_user_id=100,
 ):
@@ -31,6 +34,8 @@ def make_message(
         photo=[object()] if photo else [],
         document=None,
         sticker=object() if sticker else None,
+        video=object() if video else None,
+        animation=object() if animation else None,
         reply_to_message=reply_to,
         from_user=SimpleNamespace(id=from_user_id),
     )
@@ -48,6 +53,15 @@ class ImageTriggerTests(unittest.IsolatedAsyncioTestCase):
         reply = make_message(text="what is this?", reply_to=image)
 
         self.assertTrue(await _text_message_is_trigger(reply, make_context()))
+
+    async def test_plain_reply_to_bot_records_only_reply_reason(self):
+        replied_bot_message = make_message(from_user_id=42)
+        reply = make_message(text="hello", reply_to=replied_bot_message)
+
+        self.assertEqual(
+            await _text_message_trigger_reasons(reply, make_context()),
+            ("reply_to_bot",),
+        )
 
     async def test_standalone_image_does_not_trigger_generation(self):
         image = make_message(photo=True)
@@ -76,6 +90,37 @@ class ImageTriggerTests(unittest.IsolatedAsyncioTestCase):
         sticker = make_message(sticker=True)
 
         self.assertFalse(await _media_message_is_trigger(sticker, make_context()))
+
+    async def test_addressed_video_and_animation_trigger_generation(self):
+        replied_bot_message = make_message(from_user_id=42)
+
+        for field in ("video", "animation"):
+            with self.subTest(field=field):
+                media = make_message(
+                    reply_to=replied_bot_message,
+                    **{field: True},
+                )
+                self.assertTrue(
+                    await _media_message_is_trigger(media, make_context())
+                )
+
+    async def test_text_reply_uses_video_or_animation_as_image_source(self):
+        for field in ("video", "animation"):
+            with self.subTest(field=field):
+                media = make_message(**{field: True})
+                reply = make_message(text="what is happening?", reply_to=media)
+                self.assertTrue(
+                    await _text_message_is_trigger(reply, make_context())
+                )
+                self.assertIs(_image_source(reply), media)
+
+    async def test_standalone_video_and_animation_remain_silent(self):
+        for field in ("video", "animation"):
+            with self.subTest(field=field):
+                media = make_message(**{field: True})
+                self.assertFalse(
+                    await _media_message_is_trigger(media, make_context())
+                )
 
 
 if __name__ == "__main__":

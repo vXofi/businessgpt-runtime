@@ -37,18 +37,35 @@ def make_context(queue: FakeGenerationQueue):
         "context_cache": object(),
         "media_cache": object(),
         "generation_queue": queue,
+        "runtime_id": "runtime-test",
     }
     return SimpleNamespace(application=SimpleNamespace(bot_data=bot_data))
 
 
 def make_update(reply_text: AsyncMock):
     message = SimpleNamespace(
+        message_id=77,
         chat_id=-100,
         chat=SimpleNamespace(type=ChatType.SUPERGROUP),
+        from_user=SimpleNamespace(id=42, is_bot=False),
+        text="hello",
+        caption=None,
+        photo=[],
+        document=None,
+        sticker=None,
+        date=None,
+        edit_date=None,
+        reply_to_message=None,
         reply_text=reply_text,
     )
     return SimpleNamespace(
+        update_id=88,
+        message=message,
+        edited_message=None,
+        callback_query=None,
+        message_reaction=None,
         effective_message=message,
+        effective_chat=SimpleNamespace(id=-100),
         effective_user=SimpleNamespace(id=42),
     )
 
@@ -64,12 +81,8 @@ class GenerationHandlerQueueTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "bot.handlers._generate_and_reply_inner", new_callable=AsyncMock
-        ) as generate:
-            await _generate_and_reply(
-                update=update,
-                context=context,
-                user_text="hello",
-            )
+        ) as generate, self.assertLogs("bot.handlers", level="INFO") as captured:
+            await _generate_and_reply(update=update, context=context, user_text="secret text")
 
             generate.assert_not_awaited()
             self.assertEqual(queue.submission, (-100, 42, 5, 20))
@@ -78,6 +91,14 @@ class GenerationHandlerQueueTests(unittest.IsolatedAsyncioTestCase):
             await queue.run()
 
             generate.assert_awaited_once()
+
+        output = "\n".join(captured.output)
+        self.assertIn("generation_trigger", output)
+        self.assertIn("generation_admission", output)
+        self.assertIn("generation_job_started", output)
+        self.assertIn("generation_job_finished", output)
+        self.assertIn("source_message_id=77", output)
+        self.assertNotIn("secret text", output)
 
     async def test_full_queue_reports_unavailable_without_running(self):
         reply_text = AsyncMock()

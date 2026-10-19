@@ -38,7 +38,12 @@ fi
 
 health=""
 for ((elapsed = 0; elapsed < timeout_seconds; elapsed += 2)); do
-  if [[ "$(docker inspect "$container" --format '{{.State.Running}}' 2>/dev/null || true)" != "true" ]]; then
+  state="$(
+    docker inspect "$container" \
+      --format '{{.State.Status}} {{.RestartCount}}' 2>/dev/null || true
+  )"
+  read -r state_status restart_count <<<"$state"
+  if [[ "$state_status" != "running" || "$restart_count" != "0" ]]; then
     break
   fi
   if health="$(docker exec "$container" python -c \

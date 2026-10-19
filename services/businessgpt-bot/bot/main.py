@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from pathlib import Path
 import shutil
+import uuid
 
 from telegram import (
     BotCommand,
@@ -14,6 +17,7 @@ from telegram import (
     Update,
 )
 from telegram.error import TelegramError
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -30,14 +34,18 @@ from .config import Config
 from .crypto import FeedbackEncryptor
 from .context_cache import ContextCache
 from .db import BotDB
+from .image_generation_client import ImageGenerationClient
 from .media_cache import EncryptedMediaCache
 from .limits import GenerationQueue
+from .readiness import Readiness, polling_lock
+from .update_trace import TracingExtBot, UpdateTraceTracker
 from .validation import validate_allowed_api_url
 from .handlers import (
     authorize_update,
     cancel_command,
     error_handler,
     gpt_command,
+    image_command,
     model_delete_command,
     model_new_or_edit_command,
     model_show_command,
@@ -71,10 +79,12 @@ ALLOWED_UPDATES = [
 
 GROUP_COMMANDS = [
     BotCommand("gpt", "Generate a reply"),
+    BotCommand("image", "Generate an image"),
 ]
 
 ADMIN_COMMANDS = [
     BotCommand("gpt", "Generate a reply"),
+    BotCommand("image", "Generate an image"),
     BotCommand("settings", "Open chat settings"),
     BotCommand("status", "Show active configuration"),
     BotCommand("cancel", "Cancel pending editor action"),
@@ -100,6 +110,14 @@ OWNER_COMMANDS = [
 ]
 
 logger = logging.getLogger(__name__)
+
+
+def _visible_commands(
+    commands: list[BotCommand], *, image_generation_enabled: bool
+) -> list[BotCommand]:
+    if image_generation_enabled:
+        return commands
+    return [command for command in commands if command.command != "image"]
 
 
 async def post_init(application: Application) -> None:
@@ -131,25 +149,40 @@ async def post_init(application: Application) -> None:
     application.bot_data["bot_username"] = me.username
     try:
         await application.bot.set_my_commands(
-            GROUP_COMMANDS,
+            _visible_commands(
+                GROUP_COMMANDS,
+                image_generation_enabled=config.image_generation_enabled,
+            ),
             scope=BotCommandScopeAllGroupChats(),
         )
         await application.bot.set_my_commands(
-            ADMIN_COMMANDS,
+            _visible_commands(
+                ADMIN_COMMANDS,
+                image_generation_enabled=config.image_generation_enabled,
+            ),
             scope=BotCommandScopeAllChatAdministrators(),
         )
         await application.bot.set_my_commands(
-            ADMIN_COMMANDS,
+            _visible_commands(
+                ADMIN_COMMANDS,
+                image_generation_enabled=config.image_generation_enabled,
+            ),
             scope=BotCommandScopeAllPrivateChats(),
         )
         for owner_user_id in config.owner_user_ids:
             await application.bot.set_my_commands(
-                OWNER_COMMANDS,
+                _visible_commands(
+                    OWNER_COMMANDS,
+                    image_generation_enabled=config.image_generation_enabled,
+                ),
                 scope=BotCommandScopeChat(chat_id=owner_user_id),
             )
             for chat_id in config.allowed_chat_ids:
                 await application.bot.set_my_commands(
-                    OWNER_COMMANDS,
+                    _visible_commands(
+                        OWNER_COMMANDS,
+                        image_generation_enabled=config.image_generation_enabled,
+                    ),
                     scope=BotCommandScopeChatMember(
                         chat_id=chat_id,
                         user_id=owner_user_id,
@@ -158,14 +191,28 @@ async def post_init(application: Application) -> None:
     except TelegramError as exc:
         logger.warning("could not register Telegram command menu: %s", exc)
     application.bot_data["generation_queue"].start()
+    if config.image_generation_enabled:
+        application.bot_data["image_generation_queue"].start()
+    readiness = application.bot_data["readiness"]
+    readiness.initialized = True
+    application.bot_data["readiness_task"] = asyncio.create_task(readiness.monitor(application))
     logger.info(
-        "bot initialized username=%s telegram_proxy=%s",
+        "bot initialized runtime_id=%s username=%s telegram_proxy=%s",
+        application.bot_data["runtime_id"],
         me.username,
         "configured" if config.telegram_proxy_url else "disabled",
     )
 
 
 async def post_shutdown(application: Application) -> None:
+    readiness_task = application.bot_data.get("readiness_task")
+    if readiness_task:
+        readiness_task.cancel()
+        try:
+            await readiness_task
+        except asyncio.CancelledError:
+            pass
+    application.bot_data["readiness"].write(False)
     api: BusinessGPTClient = application.bot_data["businessgpt"]
     db: BotDB = application.bot_data["db"]
     generation_queue: GenerationQueue = application.bot_data["generation_queue"]
@@ -178,6 +225,12 @@ async def post_shutdown(application: Application) -> None:
             pass
     await generation_queue.shutdown()
     await api.close()
+    image_generation_queue = application.bot_data.get("image_generation_queue")
+    if image_generation_queue is not None:
+        await image_generation_queue.shutdown()
+    image_generation = application.bot_data.get("image_generation")
+    if image_generation is not None:
+        await image_generation.close()
     db.close()
 
 
@@ -209,18 +262,33 @@ async def _maintenance_loop(application: Application) -> None:
 
 
 def build_application(config: Config) -> Application:
+    runtime_id = uuid.uuid4().hex[:12]
+    readiness = Readiness(os.environ.get("BUSINESSGPT_READINESS_FILE"))
+    readiness.write(False)
+    bot = TracingExtBot(
+        token=config.bot_token,
+        runtime_id=runtime_id,
+        readiness=readiness,
+        request=HTTPXRequest(
+            connection_pool_size=256,
+            proxy=config.telegram_proxy_url,
+        ),
+        get_updates_request=HTTPXRequest(
+            connection_pool_size=1,
+            proxy=config.telegram_proxy_url,
+        ),
+    )
     builder = (
         ApplicationBuilder()
-        .token(config.bot_token)
+        .bot(bot)
         .concurrent_updates(8)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
     )
-    if config.telegram_proxy_url:
-        builder = builder.proxy(config.telegram_proxy_url).get_updates_proxy(
-            config.telegram_proxy_url
-        )
     application = builder.build()
+    application.bot_data["runtime_id"] = runtime_id
+    application.bot_data["readiness"] = readiness
+    application.bot_data["update_trace_tracker"] = UpdateTraceTracker()
     application.bot_data["config"] = config
     db = BotDB(
         config.db_path,
@@ -231,8 +299,19 @@ def build_application(config: Config) -> Application:
     encryptor = FeedbackEncryptor(config.feedback_public_key_b64)
     application.bot_data["db"] = db
     application.bot_data["businessgpt"] = BusinessGPTClient(
-        config.api_key, config.allowed_api_urls
+        config.api_key, config.allowed_api_urls,
+        runpod_api_key=config.runpod_api_key,
+        runpod_timeout_seconds=config.runpod_timeout_seconds,
+        runpod_proxy_url=config.runpod_proxy_url,
     )
+    if config.image_generation_enabled:
+        assert config.image_api_key is not None
+        application.bot_data["image_generation"] = ImageGenerationClient(
+            api_url=config.image_api_url,
+            api_key=config.image_api_key,
+            proxy_url=config.telegram_proxy_url,
+            timeout_seconds=config.image_generation_timeout_seconds,
+        )
     application.bot_data["feedback_encryptor"] = encryptor
     application.bot_data["context_cache"] = ContextCache(
         max_messages_per_chat=20,
@@ -246,6 +325,15 @@ def build_application(config: Config) -> Application:
         chat_requests=config.rate_limit_chat_requests,
         window_seconds=config.rate_limit_window_seconds,
     )
+    if config.image_generation_enabled:
+        application.bot_data["image_generation_queue"] = GenerationQueue(
+            max_concurrent=1,
+            max_queue_size=config.image_generation_queue_size,
+            user_requests=config.rate_limit_user_requests,
+            chat_requests=config.rate_limit_chat_requests,
+            window_seconds=config.rate_limit_window_seconds,
+            task_name_prefix="businessgpt-image-generation",
+        )
     application.bot_data["media_cache"] = EncryptedMediaCache(
         directory=config.media_cache_dir,
         ttl_seconds=config.media_cache_ttl_seconds,
@@ -260,6 +348,7 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("gpt", gpt_command))
+    application.add_handler(CommandHandler("image", image_command))
     application.add_handler(CommandHandler("prompts", prompts_command))
     application.add_handler(CommandHandler("prompt_show", prompt_show_command))
     application.add_handler(CommandHandler("prompt_use", prompt_use_command))
@@ -285,7 +374,11 @@ def build_application(config: Config) -> Application:
     )
     application.add_handler(
         MessageHandler(
-            filters.PHOTO | filters.Document.IMAGE | filters.Sticker.ALL,
+            filters.PHOTO
+            | filters.Document.IMAGE
+            | filters.Sticker.ALL
+            | filters.VIDEO
+            | filters.ANIMATION,
             media_message,
         )
     )
@@ -301,12 +394,13 @@ def main() -> None:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     config = Config.from_env()
-    app = build_application(config)
-    app.run_polling(
-        allowed_updates=ALLOWED_UPDATES,
-        drop_pending_updates=False,
-        bootstrap_retries=-1,
-    )
+    with polling_lock(Path(config.db_path).parent / ".polling.lock"):
+        app = build_application(config)
+        app.run_polling(
+            allowed_updates=ALLOWED_UPDATES,
+            drop_pending_updates=False,
+            bootstrap_retries=-1,
+        )
 
 
 if __name__ == "__main__":

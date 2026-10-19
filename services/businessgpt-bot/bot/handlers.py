@@ -3,15 +3,24 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import re
 import shlex
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update, User
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    Message,
+    Update,
+    User,
+)
 from telegram.constants import ChatAction, ChatType
 from telegram.error import TelegramError
 from telegram.ext import ApplicationHandlerStop, ContextTypes
@@ -21,13 +30,22 @@ from .config import Config
 from .context_cache import CachedMessage, ContextCache
 from .crypto import FeedbackEncryptor
 from .db import BotDB, validate_name
+from .image_generation_client import ImageGenerationClient, ImageGenerationError
 from .limits import GenerationQueue
 from .media_cache import EncryptedMediaCache
+from .runpod_client import validate_prompt
 from .tools import TOOL_REGISTRY
-from .validation import validate_allowed_api_url, validate_generation_settings
+from .update_trace import UpdateTraceTracker, describe_update, trace_id
+from .validation import (
+    is_runpod_url,
+    validate_allowed_api_url,
+    validate_generation_settings,
+    validate_image_generation_settings,
+)
 
 
 MAX_TELEGRAM_TEXT = 3900
+MAX_IMAGE_GENERATION_PROMPT_CHARS = 3900
 ALLOWED_IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 SETTING_OPTIONS: dict[str, tuple[int | float, ...]] = {
     "recent_context_messages": (0, 5, 10, 20),
@@ -38,9 +56,37 @@ SETTING_OPTIONS: dict[str, tuple[int | float, ...]] = {
     "repetition_penalty": (1.0, 1.05, 1.1, 1.2, 1.3),
     "rate_limit_user_requests": (1, 3, 5, 10, 20),
     "rate_limit_chat_requests": (5, 10, 20, 30, 50),
+    "image_generation_enabled": (0, 1),
+    "image_width": (256, 320, 384, 448, 512),
+    "image_height": (256, 320, 384, 448, 512),
+    "image_steps": tuple(range(2, 17)),
+    "image_guidance_scale": (
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        2.5,
+        3.0,
+        3.5,
+        4.0,
+        4.5,
+        5.0,
+    ),
+    "image_auto_translate": (0, 1),
 }
 ADMISSION_SETTING_FIELDS = frozenset(
     {"rate_limit_user_requests", "rate_limit_chat_requests"}
+)
+IMAGE_SETTING_FIELDS = frozenset(
+    {
+        "image_generation_enabled",
+        "image_width",
+        "image_height",
+        "image_steps",
+        "image_guidance_scale",
+        "image_auto_translate",
+    }
 )
 SETTING_LABELS = {
     "recent_context_messages": "Context",
@@ -51,6 +97,12 @@ SETTING_LABELS = {
     "repetition_penalty": "Repeat penalty",
     "rate_limit_user_requests": "Requests per user",
     "rate_limit_chat_requests": "Requests per chat",
+    "image_generation_enabled": "Image generation",
+    "image_width": "Image width",
+    "image_height": "Image height",
+    "image_steps": "Image steps",
+    "image_guidance_scale": "Image guidance",
+    "image_auto_translate": "Automatic translation",
 }
 
 logger = logging.getLogger(__name__)
@@ -83,6 +135,53 @@ def _services(
         data["context_cache"],
         data["media_cache"],
     )
+
+
+def _trace_authorized_update(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    try:
+        metadata = describe_update(update)
+        tracker: UpdateTraceTracker | None = context.application.bot_data.get(
+            "update_trace_tracker"
+        )
+        repeated = tracker.observe(metadata) if tracker else None
+        log = logger.warning if repeated else logger.info
+        log(
+            "telegram_update_dispatched runtime_id=%s update_id=%s update_type=%s "
+            "chat_id=%s message_id=%s user_id=%s sender_is_bot=%s "
+            "message_date=%s edit_date=%s reply_to_message_id=%s "
+            "reply_to_user_id=%s media_kind=%s repeated_message=%s "
+            "first_update_id=%s first_update_type=%s previous_update_id=%s "
+            "previous_update_type=%s repeat_elapsed_ms=%s",
+            context.application.bot_data.get("runtime_id", "unknown"),
+            metadata.update_id,
+            metadata.update_type,
+            metadata.chat_id,
+            metadata.message_id,
+            metadata.user_id,
+            metadata.sender_is_bot,
+            metadata.message_date,
+            metadata.edit_date,
+            metadata.reply_to_message_id,
+            metadata.reply_to_user_id,
+            metadata.media_kind,
+            repeated is not None,
+            repeated.first_update_id if repeated else None,
+            repeated.first_update_type if repeated else None,
+            repeated.previous_update_id if repeated else None,
+            repeated.previous_update_type if repeated else None,
+            repeated.elapsed_ms if repeated else None,
+        )
+    except Exception as exc:
+        logger.warning(
+            "telegram_dispatch_trace_failed runtime_id=%s update_id=%s "
+            "error_type=%s",
+            context.application.bot_data.get("runtime_id", "unknown"),
+            getattr(update, "update_id", None),
+            type(exc).__name__,
+        )
 
 
 def _user_label(user: Optional[User]) -> str:
@@ -130,12 +229,15 @@ async def authorize_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user = update.effective_user
     if chat and chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
         if chat.id in config.allowed_chat_ids:
+            _trace_authorized_update(update, context)
             return
         raise ApplicationHandlerStop
     if chat and chat.type == ChatType.PRIVATE and user:
         if _is_owner(config, user):
+            _trace_authorized_update(update, context)
             return
         if update.callback_query is not None:
+            _trace_authorized_update(update, context)
             return
         message = update.effective_message
         text = _message_content(message)
@@ -145,9 +247,11 @@ async def authorize_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             except (IndexError, ValueError):
                 target = None
             if target in config.allowed_chat_ids:
+                _trace_authorized_update(update, context)
                 return
         session_chat_id = db.get_admin_session_chat(user.id)
         if session_chat_id in config.allowed_chat_ids:
+            _trace_authorized_update(update, context)
             return
     raise ApplicationHandlerStop
 
@@ -268,7 +372,10 @@ def _has_image(message: Message | None) -> bool:
         return True
     if message.document and message.document.mime_type in ALLOWED_IMAGE_MIME_TYPES:
         return True
-    return getattr(message, "sticker", None) is not None
+    return any(
+        getattr(message, field, None) is not None
+        for field in ("sticker", "video", "animation")
+    )
 
 
 def _image_source(message: Message) -> Message | None:
@@ -283,23 +390,43 @@ async def _media_message_is_trigger(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> bool:
+    return bool(await _media_message_trigger_reasons(message, context))
+
+
+async def _media_message_trigger_reasons(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> tuple[str, ...]:
     content = _message_content(message)
-    return (
-        content.lower().startswith("/gpt")
-        or await _is_reply_to_bot(message, context)
-        or await _is_bot_mentioned(message, context)
-    )
+    reasons: list[str] = []
+    if content.lower().startswith("/gpt"):
+        reasons.append("gpt_caption")
+    if await _is_reply_to_bot(message, context):
+        reasons.append("reply_to_bot")
+    if await _is_bot_mentioned(message, context):
+        reasons.append("bot_mention")
+    return tuple(reasons)
 
 
 async def _text_message_is_trigger(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> bool:
-    return (
-        _has_image(message.reply_to_message)
-        or await _is_reply_to_bot(message, context)
-        or await _is_bot_mentioned(message, context)
-    )
+    return bool(await _text_message_trigger_reasons(message, context))
+
+
+async def _text_message_trigger_reasons(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if _has_image(message.reply_to_message):
+        reasons.append("reply_to_media")
+    if await _is_reply_to_bot(message, context):
+        reasons.append("reply_to_bot")
+    if await _is_bot_mentioned(message, context):
+        reasons.append("bot_mention")
+    return tuple(reasons)
 
 
 async def _download_image(
@@ -308,6 +435,8 @@ async def _download_image(
 ) -> DownloadedImage:
     config, *_ = _services(context)
     sticker = getattr(message, "sticker", None)
+    video = getattr(message, "video", None)
+    animation = getattr(message, "animation", None)
     sticker_format: str | None = None
     sticker_representation: str | None = None
     if message.photo:
@@ -341,22 +470,40 @@ async def _download_image(
             mime_type = ""
             filename = None
             sticker_representation = "thumbnail"
+    elif video is not None or animation is not None:
+        source = video if video is not None else animation
+        source_kind = "video" if video is not None else "animation"
+        media = source.thumbnail
+        if media is None:
+            raise ValueError(f"{source_kind} preview is unavailable")
+        mime_type = ""
+        filename = None
+        media_kind = f"telegram_{source_kind}_preview"
     else:
-        raise ValueError("supported media types: JPEG, PNG, WebP, sticker")
+        raise ValueError(
+            "supported media types: JPEG, PNG, WebP, sticker, video, animation"
+        )
     if media.file_size and media.file_size > config.image_max_bytes:
         raise ValueError("media exceeds the configured size limit")
     telegram_file = await context.bot.get_file(media.file_id)
     data = bytes(await telegram_file.download_as_bytearray())
     if len(data) > config.image_max_bytes:
         raise ValueError("media exceeds the configured size limit")
+    if sticker is not None or video is not None or animation is not None:
+        detected_mime_type = _detect_preview_image_mime(data)
     if sticker is not None:
-        detected_mime_type = _detect_sticker_image_mime(data)
         if sticker_format == "static" and detected_mime_type != "image/webp":
             raise ValueError("static sticker file is not WebP")
         if sticker_representation == "thumbnail":
             mime_type = detected_mime_type
             extension = "jpg" if mime_type == "image/jpeg" else "webp"
             filename = f"telegram-sticker-{sticker.file_unique_id}-preview.{extension}"
+    elif video is not None or animation is not None:
+        source = video if video is not None else animation
+        source_kind = "video" if video is not None else "animation"
+        mime_type = detected_mime_type
+        extension = "jpg" if mime_type == "image/jpeg" else "webp"
+        filename = f"telegram-{source_kind}-{source.file_unique_id}-preview.{extension}"
     media_metadata: dict[str, Any] = {
         "kind": media_kind,
         "mime_type": mime_type,
@@ -370,6 +517,15 @@ async def _download_image(
             "format": sticker_format,
             "representation": sticker_representation,
         }
+    elif video is not None or animation is not None:
+        source = video if video is not None else animation
+        source_kind = "video" if video is not None else "animation"
+        media_metadata[source_kind] = {
+            "duration": source.duration,
+            "width": source.width,
+            "height": source.height,
+            "representation": "telegram_thumbnail",
+        }
     return DownloadedImage(
         data=data,
         mime_type=mime_type,
@@ -378,12 +534,12 @@ async def _download_image(
     )
 
 
-def _detect_sticker_image_mime(data: bytes) -> str:
+def _detect_preview_image_mime(data: bytes) -> str:
     if data.startswith(b"\xff\xd8\xff"):
         return "image/jpeg"
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
-    raise ValueError("sticker preview must be JPEG or WebP")
+    raise ValueError("media preview must be JPEG or WebP")
 
 
 async def remember_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -482,6 +638,16 @@ async def _typing(message: Message, stop: asyncio.Event) -> None:
             await asyncio.wait_for(stop.wait(), timeout=4.0)
 
 
+async def _uploading_photo(message: Message, stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        try:
+            await message.chat.send_action(ChatAction.UPLOAD_PHOTO)
+        except Exception:
+            return
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=4.0)
+
+
 async def _generate_and_reply(
     *,
     update: Update,
@@ -489,6 +655,7 @@ async def _generate_and_reply(
     user_text: str,
     prompt_override_name: str | None = None,
     settings_chat_id: int | None = None,
+    trigger_reasons: tuple[str, ...] = ("unspecified",),
 ) -> None:
     config, db, *_ = _services(context)
     message = update.effective_message
@@ -501,8 +668,39 @@ async def _generate_and_reply(
         return
     generation_queue: GenerationQueue = context.application.bot_data["generation_queue"]
     rate_limits = db.get_effective_admission_settings(target_chat_id)
+    metadata = describe_update(update)
+    runtime_id = context.application.bot_data.get("runtime_id", "unknown")
+    request_trace_id = trace_id(runtime_id, metadata)
+    submitted_at = time.monotonic()
+    logger.info(
+        "generation_trigger runtime_id=%s trace_id=%s update_id=%s "
+        "update_type=%s source_chat_id=%s source_message_id=%s user_id=%s "
+        "settings_chat_id=%s trigger_reasons=%s reply_to_message_id=%s",
+        runtime_id,
+        request_trace_id,
+        metadata.update_id,
+        metadata.update_type,
+        metadata.chat_id,
+        metadata.message_id,
+        metadata.user_id,
+        target_chat_id,
+        ",".join(trigger_reasons),
+        metadata.reply_to_message_id,
+    )
 
     async def run_generation() -> None:
+        started_at = time.monotonic()
+        outcome = "completed"
+        logger.info(
+            "generation_job_started runtime_id=%s trace_id=%s update_id=%s "
+            "source_chat_id=%s source_message_id=%s queue_wait_ms=%s",
+            runtime_id,
+            request_trace_id,
+            metadata.update_id,
+            metadata.chat_id,
+            metadata.message_id,
+            int((started_at - submitted_at) * 1000),
+        )
         try:
             await _generate_and_reply_inner(
                 update=update,
@@ -510,17 +708,39 @@ async def _generate_and_reply(
                 user_text=user_text,
                 prompt_override_name=prompt_override_name,
                 settings_chat_id=target_chat_id,
+                request_trace_id=request_trace_id,
             )
         except asyncio.CancelledError:
+            outcome = "cancelled"
             raise
         except Exception:
+            outcome = "internal_error"
             logger.exception(
-                "generation job failed chat_id=%s user_id=%s",
+                "generation job failed runtime_id=%s trace_id=%s chat_id=%s "
+                "message_id=%s user_id=%s",
+                runtime_id,
+                request_trace_id,
                 target_chat_id,
+                metadata.message_id,
                 user.id,
             )
             with suppress(TelegramError):
                 await message.reply_text("generation failed: internal error")
+        finally:
+            logger.info(
+                "generation_job_finished runtime_id=%s trace_id=%s update_id=%s "
+                "source_chat_id=%s source_message_id=%s outcome=%s "
+                "queue_wait_ms=%s run_ms=%s total_ms=%s",
+                runtime_id,
+                request_trace_id,
+                metadata.update_id,
+                metadata.chat_id,
+                metadata.message_id,
+                outcome,
+                int((started_at - submitted_at) * 1000),
+                int((time.monotonic() - started_at) * 1000),
+                int((time.monotonic() - submitted_at) * 1000),
+            )
 
     admission = await generation_queue.submit(
         chat_id=target_chat_id,
@@ -528,6 +748,22 @@ async def _generate_and_reply(
         run=run_generation,
         user_requests=rate_limits["rate_limit_user_requests"],
         chat_requests=rate_limits["rate_limit_chat_requests"],
+    )
+    logger.info(
+        "generation_admission runtime_id=%s trace_id=%s update_id=%s "
+        "source_chat_id=%s source_message_id=%s allowed=%s queued=%s "
+        "position=%s reason=%s active=%s pending=%s",
+        runtime_id,
+        request_trace_id,
+        metadata.update_id,
+        metadata.chat_id,
+        metadata.message_id,
+        admission.allowed,
+        admission.queued,
+        admission.position,
+        admission.reason,
+        getattr(generation_queue, "active", None),
+        getattr(generation_queue, "pending", None),
     )
     if not admission.allowed:
         await message.reply_text(f"generation unavailable: {admission.reason}")
@@ -540,6 +776,7 @@ async def _generate_and_reply_inner(
     user_text: str,
     prompt_override_name: str | None = None,
     settings_chat_id: int,
+    request_trace_id: str,
 ) -> None:
     config, db, api, encryptor, cache, media_cache = _services(context)
     message = update.effective_message
@@ -558,7 +795,11 @@ async def _generate_and_reply_inner(
     except ValueError as exc:
         await message.reply_text(f"model profile rejected: {exc}")
         return
-    if active_prompt is None:
+    deferred_default = active_prompt is None and is_runpod_url(api_url)
+    if deferred_default:
+        prompt_text = None
+        prompt_name = "API default"
+    elif active_prompt is None:
         try:
             default_prompt = await api.get_default_prompt(api_url=api_url)
             prompt_text = str(default_prompt["text"])
@@ -577,11 +818,14 @@ async def _generate_and_reply_inner(
     try:
         image = await _download_image(image_source, context) if image_source else None
     except (ValueError, httpx.HTTPError, TelegramError) as exc:
-        media_label = (
-            "sticker"
-            if image_source and getattr(image_source, "sticker", None) is not None
-            else "image"
-        )
+        media_label = "image"
+        if image_source:
+            if getattr(image_source, "sticker", None) is not None:
+                media_label = "sticker"
+            elif getattr(image_source, "video", None) is not None:
+                media_label = "video"
+            elif getattr(image_source, "animation", None) is not None:
+                media_label = "animation"
         await message.reply_text(f"{media_label} rejected: {exc}")
         return
     messages = await _build_messages(
@@ -594,6 +838,18 @@ async def _generate_and_reply_inner(
 
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(_typing(message, stop_typing))
+    api_started_at = time.monotonic()
+    logger.info(
+        "generation_api_started runtime_id=%s trace_id=%s source_chat_id=%s "
+        "source_message_id=%s model_profile=%s has_image=%s message_count=%s",
+        context.application.bot_data.get("runtime_id", "unknown"),
+        request_trace_id,
+        message.chat_id,
+        message.message_id,
+        model["name"],
+        image is not None,
+        len(messages),
+    )
     try:
         result = await api.generate(
             api_url=api_url,
@@ -605,27 +861,73 @@ async def _generate_and_reply_inner(
             top_k=generation["top_k"],
             repetition_penalty=generation["repetition_penalty"],
         )
+        if deferred_default:
+            default_prompt = validate_prompt(result.pop("default_prompt", None))
+            if result.get("usage", {}).get("prompt_hash") != default_prompt["prompt_hash"]:
+                raise httpx.HTTPError("Runpod generation prompt hash mismatch")
+            prompt_text = default_prompt["text"]
+            prompt_name = default_prompt["name"]
     except httpx.HTTPError as exc:
+        logger.warning(
+            "generation_api_failed runtime_id=%s trace_id=%s source_chat_id=%s "
+            "source_message_id=%s error_type=%s elapsed_ms=%s",
+            context.application.bot_data.get("runtime_id", "unknown"),
+            request_trace_id,
+            message.chat_id,
+            message.message_id,
+            type(exc).__name__,
+            int((time.monotonic() - api_started_at) * 1000),
+        )
         await message.reply_text(f"generation failed: {exc}")
         return
+    except Exception as exc:
+        logger.warning(
+            "generation_api_failed runtime_id=%s trace_id=%s source_chat_id=%s "
+            "source_message_id=%s error_type=%s elapsed_ms=%s",
+            context.application.bot_data.get("runtime_id", "unknown"),
+            request_trace_id,
+            message.chat_id,
+            message.message_id,
+            type(exc).__name__,
+            int((time.monotonic() - api_started_at) * 1000),
+        )
+        raise
     finally:
         stop_typing.set()
         with suppress(asyncio.CancelledError):
             await typing_task
 
+    logger.info(
+        "generation_api_finished runtime_id=%s trace_id=%s source_chat_id=%s "
+        "source_message_id=%s elapsed_ms=%s",
+        context.application.bot_data.get("runtime_id", "unknown"),
+        request_trace_id,
+        message.chat_id,
+        message.message_id,
+        int((time.monotonic() - api_started_at) * 1000),
+    )
+
+    assert prompt_text is not None
     response_text = _disable_telegram_mentions(str(result.get("response", ""))).strip() or "[empty response]"
     chunks = [response_text[i : i + MAX_TELEGRAM_TEXT] for i in range(0, len(response_text), MAX_TELEGRAM_TEXT)]
     sent_messages = [await message.reply_text(chunk) for chunk in chunks]
     usage = result.get("usage") or {}
     expected_prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
     prompt_hash_verified = usage.get("prompt_hash") == expected_prompt_hash
+    update_metadata = describe_update(update)
     feedback_payload = {
         "feedback_schema_version": 2,
         "trigger": {
+            "update_id": update_metadata.update_id,
+            "update_type": update_metadata.update_type,
             "chat_id": message.chat_id,
             "message_id": message.message_id,
             "from_user_id": message.from_user.id if message.from_user else None,
             "from_user_label": _user_label(message.from_user),
+            "message_date": update_metadata.message_date,
+            "edit_date": update_metadata.edit_date,
+            "reply_to_message_id": update_metadata.reply_to_message_id,
+            "reply_to_user_id": update_metadata.reply_to_user_id,
             "text": _message_content(message),
             "has_image": image is not None,
             "media": image.media_metadata if image else None,
@@ -684,7 +986,165 @@ async def gpt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not text and not message.reply_to_message and not _has_image(message):
         await message.reply_text("usage: /gpt <message>, attach an image, or reply with /gpt")
         return
-    await _generate_and_reply(update=update, context=context, user_text=text)
+    await _generate_and_reply(
+        update=update,
+        context=context,
+        user_text=text,
+        trigger_reasons=("gpt_command",),
+    )
+
+
+async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config, db, *_ = _services(context)
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+
+    prompt = re.sub(
+        r"^/image(?:@\w+)?\b", "", _message_content(message), flags=re.I
+    ).strip()
+    if not prompt and message.reply_to_message:
+        prompt = _message_content(message.reply_to_message)
+    if not prompt:
+        await message.reply_text("usage: /image <description> or reply to text with /image")
+        return
+    if len(prompt) > MAX_IMAGE_GENERATION_PROMPT_CHARS:
+        await message.reply_text(
+            f"image prompt is too long (maximum {MAX_IMAGE_GENERATION_PROMPT_CHARS} characters)"
+        )
+        return
+
+    target_chat_id = _target_chat_id(message, user, db, config)
+    if target_chat_id not in config.allowed_chat_ids:
+        await message.reply_text("not allowed")
+        return
+    if not config.image_generation_enabled:
+        await message.reply_text("image generation is disabled by server policy")
+        return
+
+    image_settings = db.get_image_generation_settings(target_chat_id)
+    if not image_settings["enabled"]:
+        await message.reply_text("image generation is disabled for this chat")
+        return
+
+    queue: GenerationQueue = context.application.bot_data["image_generation_queue"]
+    client: ImageGenerationClient = context.application.bot_data["image_generation"]
+    rate_limits = db.get_effective_admission_settings(target_chat_id)
+    metadata = describe_update(update)
+    runtime_id = context.application.bot_data.get("runtime_id", "unknown")
+    request_trace_id = trace_id(runtime_id, metadata)
+    submitted_at = time.monotonic()
+    logger.info(
+        "image_generation_trigger runtime_id=%s trace_id=%s update_id=%s "
+        "source_chat_id=%s source_message_id=%s user_id=%s prompt_chars=%s",
+        runtime_id,
+        request_trace_id,
+        metadata.update_id,
+        metadata.chat_id,
+        metadata.message_id,
+        metadata.user_id,
+        len(prompt),
+    )
+
+    async def run_generation() -> None:
+        started_at = time.monotonic()
+        outcome = "completed"
+        stop_action = asyncio.Event()
+        action_task = asyncio.create_task(_uploading_photo(message, stop_action))
+        logger.info(
+            "image_generation_started runtime_id=%s trace_id=%s update_id=%s "
+            "source_chat_id=%s source_message_id=%s queue_wait_ms=%s",
+            runtime_id,
+            request_trace_id,
+            metadata.update_id,
+            metadata.chat_id,
+            metadata.message_id,
+            int((started_at - submitted_at) * 1000),
+        )
+        try:
+            image = await client.generate(
+                prompt,
+                width=image_settings["width"],
+                height=image_settings["height"],
+                steps=image_settings["steps"],
+                guidance_scale=image_settings["guidance_scale"],
+                auto_translate=image_settings["auto_translate"],
+            )
+            await message.reply_photo(
+                photo=InputFile(image, filename="generated.png"),
+                has_spoiler=True,
+            )
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except ImageGenerationError as exc:
+            outcome = "service_error"
+            logger.warning(
+                "image generation failed runtime_id=%s trace_id=%s "
+                "source_chat_id=%s source_message_id=%s error_type=%s",
+                runtime_id,
+                request_trace_id,
+                metadata.chat_id,
+                metadata.message_id,
+                type(exc).__name__,
+            )
+            with suppress(TelegramError):
+                await message.reply_text(f"image generation failed: {exc}")
+        except Exception:
+            outcome = "internal_error"
+            logger.exception(
+                "image generation failed runtime_id=%s trace_id=%s "
+                "source_chat_id=%s source_message_id=%s",
+                runtime_id,
+                request_trace_id,
+                metadata.chat_id,
+                metadata.message_id,
+            )
+            with suppress(TelegramError):
+                await message.reply_text("image generation failed: internal error")
+        finally:
+            stop_action.set()
+            await action_task
+            logger.info(
+                "image_generation_finished runtime_id=%s trace_id=%s update_id=%s "
+                "source_chat_id=%s source_message_id=%s outcome=%s "
+                "queue_wait_ms=%s run_ms=%s total_ms=%s",
+                runtime_id,
+                request_trace_id,
+                metadata.update_id,
+                metadata.chat_id,
+                metadata.message_id,
+                outcome,
+                int((started_at - submitted_at) * 1000),
+                int((time.monotonic() - started_at) * 1000),
+                int((time.monotonic() - submitted_at) * 1000),
+            )
+
+    admission = await queue.submit(
+        chat_id=target_chat_id,
+        user_id=user.id,
+        run=run_generation,
+        user_requests=rate_limits["rate_limit_user_requests"],
+        chat_requests=rate_limits["rate_limit_chat_requests"],
+    )
+    logger.info(
+        "image_generation_admission runtime_id=%s trace_id=%s update_id=%s "
+        "source_chat_id=%s source_message_id=%s allowed=%s queued=%s "
+        "reason=%s active=%s pending=%s",
+        runtime_id,
+        request_trace_id,
+        metadata.update_id,
+        metadata.chat_id,
+        metadata.message_id,
+        admission.allowed,
+        admission.queued,
+        admission.reason,
+        queue.active,
+        queue.pending,
+    )
+    if not admission.allowed:
+        await message.reply_text(f"image generation unavailable: {admission.reason}")
 
 
 async def media_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -692,11 +1152,17 @@ async def media_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not message:
         return
     content = _message_content(message)
-    if not await _media_message_is_trigger(message, context):
+    trigger_reasons = await _media_message_trigger_reasons(message, context)
+    if not trigger_reasons:
         return
     text = re.sub(r"^/gpt(?:@\w+)?\b", "", content, flags=re.I).strip()
     text = await _strip_bot_mention(text, context)
-    await _generate_and_reply(update=update, context=context, user_text=text)
+    await _generate_and_reply(
+        update=update,
+        context=context,
+        user_text=text,
+        trigger_reasons=trigger_reasons,
+    )
 
 
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -759,6 +1225,24 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     user_text=message.text,
                     prompt_override_name=pending["target_name"],
                     settings_chat_id=target_chat_id,
+                    trigger_reasons=("prompt_test_pending",),
+                )
+                return
+            if pending["action"] == "image_custom_settings":
+                try:
+                    values = _parse_image_custom_settings(message.text)
+                    db.set_image_generation_settings(target_chat_id, **values)
+                except ValueError as exc:
+                    await message.reply_text(str(exc))
+                    return
+                db.delete_pending_action(chat_id=message.chat_id, user_id=user.id)
+                current = db.get_image_generation_settings(target_chat_id)
+                await message.reply_text(
+                    "saved image settings: "
+                    f"{current['width']}x{current['height']}, "
+                    f"{current['steps']} steps, guidance "
+                    f"{current['guidance_scale']}, translation "
+                    f"{'on' if current['auto_translate'] else 'off'}"
                 )
                 return
             if pending["action"] in {"model_new_spec", "model_edit_spec"}:
@@ -795,11 +1279,13 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 db.delete_pending_action(chat_id=message.chat_id, user_id=user.id)
                 await message.reply_text(f"saved model: {name}")
                 return
-    if await _text_message_is_trigger(message, context):
+    trigger_reasons = await _text_message_trigger_reasons(message, context)
+    if trigger_reasons:
         await _generate_and_reply(
             update=update,
             context=context,
             user_text=await _strip_bot_mention(message.text, context),
+            trigger_reasons=trigger_reasons,
         )
 
 
@@ -853,6 +1339,123 @@ def _prompt_preview_text(name: str, prompt_text: str, max_length: int = 3800) ->
     return f"{header}{prompt_text[:retained].rstrip()}{marker}"
 
 
+def _image_setting_values(settings: dict[str, Any]) -> dict[str, int | float]:
+    return {
+        "image_generation_enabled": int(settings["enabled"]),
+        "image_width": settings["width"],
+        "image_height": settings["height"],
+        "image_steps": settings["steps"],
+        "image_guidance_scale": settings["guidance_scale"],
+        "image_auto_translate": int(settings["auto_translate"]),
+    }
+
+
+def _parse_image_custom_settings(text: str) -> dict[str, int | float]:
+    raw = text.strip()
+    if not raw:
+        raise ValueError("send image settings as JSON or: width height steps guidance [translate]")
+
+    if raw.startswith("{"):
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid image settings JSON: {exc.msg}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("image settings JSON must be an object")
+        aliases = {
+            "width": "image_width",
+            "height": "image_height",
+            "steps": "image_steps",
+            "guidance_scale": "image_guidance_scale",
+            "auto_translate": "image_auto_translate",
+        }
+        unknown = set(payload) - set(aliases)
+        if unknown:
+            raise ValueError(f"unknown image setting: {sorted(unknown)[0]}")
+        required = {"width", "height", "steps", "guidance_scale"}
+        missing = required - set(payload)
+        if missing:
+            raise ValueError(f"missing image setting: {sorted(missing)[0]}")
+        values = {aliases[name]: value for name, value in payload.items()}
+    else:
+        args = shlex.split(raw)
+        if len(args) not in {4, 5}:
+            raise ValueError(
+                "send: width height steps guidance [translate]; "
+                "translate is on/off"
+            )
+        values = {
+            "image_width": args[0],
+            "image_height": args[1],
+            "image_steps": args[2],
+            "image_guidance_scale": args[3],
+        }
+        if len(args) == 5:
+            translate = args[4].lower()
+            if translate not in {"1", "0", "true", "false", "on", "off"}:
+                raise ValueError("translate must be on or off")
+            values["image_auto_translate"] = int(
+                translate in {"1", "true", "on"}
+            )
+
+    return validate_image_generation_settings(**values)
+
+
+def _image_settings_view(
+    chat_id: int, settings: dict[str, Any]
+) -> tuple[str, InlineKeyboardMarkup]:
+    cb = lambda action: _settings_callback_data(chat_id, action)
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"Chat: {'on' if settings['enabled'] else 'off'}",
+                callback_data=cb("field:image_generation_enabled"),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"Width {settings['width']}",
+                callback_data=cb("field:image_width"),
+            ),
+            InlineKeyboardButton(
+                f"Height {settings['height']}",
+                callback_data=cb("field:image_height"),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"Steps {settings['steps']}",
+                callback_data=cb("field:image_steps"),
+            ),
+            InlineKeyboardButton(
+                f"Guidance {settings['guidance_scale']}",
+                callback_data=cb("field:image_guidance_scale"),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"Translate: {'on' if settings['auto_translate'] else 'off'}",
+                callback_data=cb("field:image_auto_translate"),
+            )
+        ],
+        [InlineKeyboardButton("Custom parameters", callback_data=cb("image_custom"))],
+        [InlineKeyboardButton("Back", callback_data=cb("home"))],
+    ]
+    text = (
+        "Image generation settings\n\n"
+        f"Current: {settings['width']}x{settings['height']}, "
+        f"{settings['steps']} steps, guidance {settings['guidance_scale']}, "
+        f"translation {'on' if settings['auto_translate'] else 'off'}"
+    )
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _setting_option_label(field: str, value: int | float) -> str:
+    if field in {"image_generation_enabled", "image_auto_translate"}:
+        return "On" if value == 1 else "Off"
+    return str(value)
+
+
 def _settings_view(
     db: BotDB,
     chat_id: int,
@@ -860,11 +1463,13 @@ def _settings_view(
     bot_username: str | None,
     private: bool,
     rate_window_seconds: int = 60,
+    image_generation_globally_enabled: bool = True,
 ) -> tuple[str, InlineKeyboardMarkup]:
     prompt = db.get_active_prompt(chat_id)
     model = db.get_active_model_profile(chat_id)
     values = db.get_effective_generation_settings(chat_id)
     rate_limits = db.get_effective_admission_settings(chat_id)
+    image_settings = db.get_image_generation_settings(chat_id)
     prompt_name = prompt["name"] if prompt else "API default"
     model_name = model["name"]
     text = "\n".join(
@@ -880,6 +1485,14 @@ def _settings_view(
             f"Repeat penalty: {values['repetition_penalty']}",
             f"User rate: {rate_limits['rate_limit_user_requests']}/{rate_window_seconds}s",
             f"Chat rate: {rate_limits['rate_limit_chat_requests']}/{rate_window_seconds}s",
+            (
+                "Images: disabled by server policy"
+                if not image_generation_globally_enabled
+                else "Images: "
+                f"{'on' if image_settings['enabled'] else 'off'}, "
+                f"{image_settings['width']}x{image_settings['height']}, "
+                f"{image_settings['steps']} steps"
+            ),
             "",
             "Prompt editing works here; model endpoint editing requires an owner."
             if private else "Open the private editor for prompt management.",
@@ -946,6 +1559,18 @@ def _settings_view(
                 ),
             ),
         ],
+        [
+            InlineKeyboardButton(
+                (
+                    "Images: server-disabled"
+                    if not image_generation_globally_enabled
+                    else "Images: "
+                    f"{'on' if image_settings['enabled'] else 'off'} "
+                    f"{image_settings['width']}x{image_settings['height']}"
+                ),
+                callback_data=_settings_callback_data(chat_id, "images"),
+            )
+        ],
     ]
     if not private and bot_username:
         rows.append([InlineKeyboardButton("Edit in private chat", url=f"https://t.me/{bot_username}?start=settings_{_encode_chat_id(chat_id)}")])
@@ -965,6 +1590,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         bot_username=username,
         private=message.chat.type == ChatType.PRIVATE,
         rate_window_seconds=config.rate_limit_window_seconds,
+        image_generation_globally_enabled=config.image_generation_enabled,
     )
     await message.reply_text(text, reply_markup=keyboard)
 
@@ -1070,6 +1696,30 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.edit_message_text(instruction)
         await query.answer()
         return
+    if data == "image_custom":
+        if not private:
+            await query.answer("open the private editor", show_alert=True)
+            return
+        if not config.image_generation_enabled:
+            await query.answer("disabled by server policy", show_alert=True)
+            return
+        db.set_pending_action(
+            chat_id=query.message.chat_id,
+            user_id=update.effective_user.id,
+            target_chat_id=target,
+            action="image_custom_settings",
+            target_name="image_custom",
+        )
+        await query.edit_message_text(
+            "Send custom image settings as JSON:\n"
+            '{"width":512,"height":512,"steps":16,'
+            '"guidance_scale":5.0,"auto_translate":true}\n\n'
+            "Or send: width height steps guidance [translate]\n"
+            "Limits: width/height 256-512 in 64px steps; steps 2-16; "
+            "guidance 0-5; translate on/off."
+        )
+        await query.answer()
+        return
     if data in {"prompt_edit", "prompt_test", "model_edit"}:
         if not private:
             await query.answer("open the private editor", show_alert=True)
@@ -1145,6 +1795,13 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if value is None:
             await query.answer("invalid value", show_alert=True)
             return
+        if (
+            field == "image_generation_enabled"
+            and value == 1
+            and not config.image_generation_enabled
+        ):
+            await query.answer("disabled by server policy", show_alert=True)
+            return
         db.set_chat_setting(target, field, value)
     elif data.startswith("prompt:"):
         prompt_id = int(data.rsplit(":", 1)[1])
@@ -1172,18 +1829,45 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         values = (
             db.get_effective_admission_settings(target)
             if field in ADMISSION_SETTING_FIELDS
+            else _image_setting_values(db.get_image_generation_settings(target))
+            if field in IMAGE_SETTING_FIELDS
             else db.get_effective_generation_settings(target)
         )
         buttons = [
             InlineKeyboardButton(
-                ("* " if option == values[field] else "") + str(option),
+                ("* " if option == values[field] else "")
+                + _setting_option_label(field, option),
                 callback_data=cb(f"set:{field}:{option}"),
             )
             for option in SETTING_OPTIONS[field]
         ]
         rows = [buttons[index : index + 3] for index in range(0, len(buttons), 3)]
-        rows.append([InlineKeyboardButton("Back", callback_data=cb("home"))])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "Back",
+                    callback_data=cb(
+                        "images" if field in IMAGE_SETTING_FIELDS else "home"
+                    ),
+                )
+            ]
+        )
         await query.edit_message_text(SETTING_LABELS[field], reply_markup=InlineKeyboardMarkup(rows))
+        await query.answer()
+        return
+    if data == "images":
+        values = db.get_image_generation_settings(target)
+        if not config.image_generation_enabled:
+            await query.edit_message_text(
+                "Image generation is disabled by server policy. Telegram settings cannot enable it.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Back", callback_data=cb("home"))]]
+                ),
+            )
+            await query.answer()
+            return
+        text, keyboard = _image_settings_view(target, values)
+        await query.edit_message_text(text, reply_markup=keyboard)
         await query.answer()
         return
     if data == "prompts":
@@ -1227,6 +1911,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         bot_username=username,
         private=query.message.chat.type == ChatType.PRIVATE,
         rate_window_seconds=config.rate_limit_window_seconds,
+        image_generation_globally_enabled=config.image_generation_enabled,
     )
     await query.edit_message_text(text, reply_markup=keyboard)
     await query.answer("saved" if data.startswith(("set:", "prompt:", "model:")) else None)
@@ -1292,7 +1977,13 @@ async def prompt_reset_command(update: Update, context: ContextTypes.DEFAULT_TYP
 async def prompt_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_admin(update, context): return
     if len(context.args or []) < 2: await update.effective_message.reply_text("usage: /prompt_test <name> <message>"); return
-    await _generate_and_reply(update=update, context=context, user_text=" ".join(context.args[1:]), prompt_override_name=context.args[0])
+    await _generate_and_reply(
+        update=update,
+        context=context,
+        user_text=" ".join(context.args[1:]),
+        prompt_override_name=context.args[0],
+        trigger_reasons=("prompt_test_command",),
+    )
 
 
 async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1360,9 +2051,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     model = db.get_active_model_profile(target)
     values = db.get_effective_generation_settings(target)
     rate_limits = db.get_effective_admission_settings(target)
+    image_settings = db.get_image_generation_settings(target)
     bot_id, username = await _bot_identity(context)
     stats = db.feedback_stats()
     generation_queue: GenerationQueue = context.application.bot_data["generation_queue"]
+    image_generation_queue = context.application.bot_data.get(
+        "image_generation_queue"
+    )
     await _reply(
         message,
         "\n".join(
@@ -1379,6 +2074,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"/{config.rate_limit_window_seconds}s",
                 f"generation_active: {generation_queue.active}",
                 f"generation_queued: {generation_queue.pending}",
+                f"image_generation_policy: {'enabled' if config.image_generation_enabled else 'disabled'}",
+                f"image_generation_chat: {'enabled' if image_settings['enabled'] else 'disabled'}",
+                "image_generation_active: "
+                f"{image_generation_queue.active if image_generation_queue else 0}",
+                "image_generation_queued: "
+                f"{image_generation_queue.pending if image_generation_queue else 0}",
                 f"feedback_pending: {stats['unreacted_rows']}",
                 f"feedback_reacted: {stats['reacted_rows']}",
                 f"feedback_media: {stats['media_rows']}",
@@ -1416,11 +2117,16 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     update_id = getattr(update, "update_id", None)
     effective_chat = getattr(update, "effective_chat", None)
     effective_user = getattr(update, "effective_user", None)
+    updater = getattr(context.application, "updater", None)
     logger.error(
-        "bot handler error update_id=%s update_type=%s chat_id=%s user_id=%s",
+        "bot handler error runtime_id=%s update_id=%s update_type=%s "
+        "chat_id=%s user_id=%s polling_offset=%s error_type=%s",
+        context.application.bot_data.get("runtime_id", "unknown"),
         update_id,
         type(update).__name__,
         getattr(effective_chat, "id", None),
         getattr(effective_user, "id", None),
+        getattr(updater, "_last_update_id", None),
+        type(context.error).__name__ if context.error else None,
         exc_info=context.error,
     )

@@ -1,5 +1,9 @@
 *
 !Dockerfile
+!Dockerfile.cuda
+!benchmark_gpu.py
+!runpod_worker.py
+!requirements-runpod.lock
 !requirements.lock
 !server.py
 !context_window.py
@@ -7,4 +11,5 @@
 !api_security.py
 !request_models.py
 !model_verification.py
+!backend_provenance.py
 !model-manifest.json

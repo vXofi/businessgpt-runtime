@@ -38,6 +38,11 @@ class RequestModelTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValidationError):
                 GenerateRequest(prompt="test", temperature=value)
 
+    def test_validates_optional_seed(self) -> None:
+        self.assertEqual(GenerateRequest(prompt="test", seed=42).seed, 42)
+        with self.assertRaises(ValidationError):
+            GenerateRequest(prompt="test", seed=-1)
+
 
 if __name__ == "__main__":
     unittest.main()

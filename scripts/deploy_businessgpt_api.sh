@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 target="${BUSINESSGPT_DEPLOY_TARGET:?Set BUSINESSGPT_DEPLOY_TARGET to user@host}"
-ssh_key="${BUSINESSGPT_SSH_KEY:-$HOME/.ssh/businessgpt_ed25519}"
+ssh_key="${BUSINESSGPT_SSH_KEY:?Set an explicit SSH identity file}"
 remote_dir="/opt/businessgpt"
 
 scripts/build_businessgpt_api_amd64.sh

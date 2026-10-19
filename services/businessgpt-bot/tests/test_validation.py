@@ -6,6 +6,7 @@ from bot.validation import (
     validate_allowed_api_url,
     validate_admission_value,
     validate_generation_value,
+    validate_image_generation_value,
 )
 
 
@@ -44,6 +45,26 @@ class ValidationTests(unittest.TestCase):
         for value in (0, 1.5, math.nan, 101):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 validate_admission_value("rate_limit_user_requests", value)
+
+    def test_image_settings_enforce_documented_limits(self):
+        self.assertEqual(validate_image_generation_value("image_width", 384), 384)
+        self.assertEqual(
+            validate_image_generation_value("image_guidance_scale", 5.0), 5.0
+        )
+        self.assertEqual(validate_image_generation_value("image_steps", 16), 16)
+        self.assertEqual(
+            validate_image_generation_value("image_generation_enabled", 0), 0
+        )
+        for field, value in (
+            ("image_width", 300),
+            ("image_height", 576),
+            ("image_steps", 17),
+            ("image_guidance_scale", 5.1),
+            ("image_guidance_scale", math.nan),
+            ("image_auto_translate", 2),
+        ):
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                validate_image_generation_value(field, value)
 
 
 if __name__ == "__main__":
